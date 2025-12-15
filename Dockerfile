@@ -1,11 +1,6 @@
-FROM node:20-slim
+FROM node:20-bookworm
 
-# Install dependencies for Claude CLI and git operations
-RUN apt-get update && apt-get install -y \
-    git \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# node:20-bookworm already includes git, curl, ca-certificates
 
 # Install Claude CLI globally
 RUN npm install -g @anthropic-ai/claude-code
@@ -16,14 +11,17 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install ALL dependencies (including devDeps for build)
+RUN npm ci
 
 # Copy application code
 COPY . .
 
 # Build frontend
 RUN npm run build
+
+# Remove dev dependencies after build
+RUN npm prune --production
 
 # Create app user
 RUN useradd -m -s /bin/bash claude \
