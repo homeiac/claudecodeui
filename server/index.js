@@ -74,6 +74,7 @@ import cliAuthRoutes from './routes/cli-auth.js';
 import userRoutes from './routes/user.js';
 import { initializeDatabase } from './database/db.js';
 import { validateApiKey, authenticateToken, authenticateWebSocket } from './middleware/auth.js';
+import { initMqttBridge, shutdownMqttBridge } from './bridges/mqtt-bridge.js';
 
 // File system watcher for projects folder
 let projectsWatcher = null;
@@ -1560,11 +1561,30 @@ async function startServer() {
 
             // Start watching the projects folder for changes
             await setupProjectsWatcher();
+
+            // Initialize MQTT bridge (if enabled via MQTT_ENABLED=true)
+            const mqttClient = initMqttBridge();
+            if (mqttClient) {
+                console.log(`${c.info('[INFO]')} MQTT Bridge initialized`);
+            }
         });
     } catch (error) {
         console.error('[ERROR] Failed to start server:', error);
         process.exit(1);
     }
 }
+
+// Graceful shutdown handler
+process.on('SIGTERM', () => {
+    console.log('[INFO] Received SIGTERM, shutting down gracefully...');
+    shutdownMqttBridge();
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('[INFO] Received SIGINT, shutting down gracefully...');
+    shutdownMqttBridge();
+    process.exit(0);
+});
 
 startServer();

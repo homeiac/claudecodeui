@@ -94,6 +94,11 @@ function mapCliOptionsToSDK(options = {}) {
     sdkOptions.resume = sessionId;
   }
 
+  // Map canUseTool callback for MQTT approval queue
+  if (options.canUseTool && typeof options.canUseTool === 'function') {
+    sdkOptions.canUseTool = options.canUseTool;
+  }
+
   return sdkOptions;
 }
 

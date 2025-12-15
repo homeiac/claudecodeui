@@ -2,6 +2,18 @@ FROM node:20-bookworm
 
 # node:20-bookworm already includes git, curl, ca-certificates
 
+# Install additional tools: sudo, sshpass, kubectl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sudo \
+    sshpass \
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    && chmod +x kubectl \
+    && mv kubectl /usr/local/bin/
+
 # Install Claude CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
@@ -23,10 +35,12 @@ RUN npm run build
 # Remove dev dependencies after build
 RUN npm prune --production
 
-# Create app user
+# Create app user with sudo access
 RUN useradd -m -s /bin/bash claude \
     && mkdir -p /home/claude/.claude /home/claude/projects \
-    && chown -R claude:claude /home/claude /app
+    && chown -R claude:claude /home/claude /app \
+    && echo "claude ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/claude \
+    && chmod 0440 /etc/sudoers.d/claude
 
 USER claude
 
