@@ -14,7 +14,6 @@
 import mqtt from 'mqtt';
 import { approvalQueue } from './approval-queue.js';
 import { queryClaudeSDK } from '../claude-sdk.js';
-import { userDb } from '../database/db.js';
 
 // Configuration from environment
 const CONFIG = {
@@ -164,10 +163,14 @@ async function handleCommand(payload) {
       throw new Error('Missing required field: message');
     }
 
-    // Get user context (platform mode - use first user)
-    const user = userDb.getFirstUser();
-    if (!user) {
-      throw new Error('No user configured for MQTT bridge. Please register via web UI first.');
+    // Verify Claude CLI is authenticated (checks ~/.claude/.credentials.json)
+    // The SDK will use these credentials directly
+    const credentialsPath = process.env.HOME + '/.claude/.credentials.json';
+    try {
+      const fs = await import('fs/promises');
+      await fs.access(credentialsPath);
+    } catch {
+      throw new Error('Claude CLI not authenticated. Run "claude" to login first.');
     }
 
     // Create MQTT response writer
