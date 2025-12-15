@@ -2,11 +2,15 @@ FROM node:20-bookworm
 
 # node:20-bookworm already includes git, curl, ca-certificates
 
-# Install additional tools: sudo, sshpass, kubectl
+# Install additional tools for Claude Code operations
+# To add more packages: edit this list and rebuild image
+# Current packages: sudo, sshpass, ssh-client, jq, sqlite3
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     sshpass \
     openssh-client \
+    jq \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl
