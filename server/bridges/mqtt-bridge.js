@@ -111,8 +111,14 @@ class MQTTResponseWriter {
 function createMqttCanUseTool(sessionId, sourceDevice) {
   return async (toolName, input) => {
     const requestId = approvalQueue.generateRequestId();
+    const startTime = Date.now();
 
-    console.log(`[MQTT Bridge] Permission request for ${toolName}:`, input);
+    console.log(`[MQTT Approval] >>> REQUEST ${requestId}`);
+    console.log(`[MQTT Approval]     Tool: ${toolName}`);
+    console.log(`[MQTT Approval]     Command: ${input.command || 'N/A'}`);
+    console.log(`[MQTT Approval]     Session: ${sessionId}, Device: ${sourceDevice}`);
+    console.log(`[MQTT Approval]     Timeout: ${CONFIG.approvalTimeout}ms`);
+    console.log(`[MQTT Approval]     Publishing to: ${CONFIG.approvalRequestTopic}`);
 
     // Publish approval request to MQTT
     mqttClient.publish(CONFIG.approvalRequestTopic, JSON.stringify({
@@ -127,11 +133,16 @@ function createMqttCanUseTool(sessionId, sourceDevice) {
       timestamp: Date.now()
     }));
 
+    console.log(`[MQTT Approval]     Published, waiting for response on: ${CONFIG.approvalResponseTopic}`);
+
     try {
       // Wait for response via approval queue
       const response = await approvalQueue.waitForResponse(requestId, CONFIG.approvalTimeout);
+      const elapsed = Date.now() - startTime;
 
-      console.log(`[MQTT Bridge] Approval response for ${requestId}:`, response);
+      console.log(`[MQTT Approval] <<< RESPONSE ${requestId} (${elapsed}ms)`);
+      console.log(`[MQTT Approval]     Approved: ${response.approved}`);
+      console.log(`[MQTT Approval]     Reason: ${response.reason || 'N/A'}`);
 
       if (response.approved) {
         return { behavior: 'allow', updatedInput: input };
@@ -139,7 +150,10 @@ function createMqttCanUseTool(sessionId, sourceDevice) {
         return { behavior: 'deny', message: response.reason || 'Denied by user' };
       }
     } catch (error) {
-      console.error(`[MQTT Bridge] Approval timeout/error for ${requestId}:`, error.message);
+      const elapsed = Date.now() - startTime;
+      console.error(`[MQTT Approval] !!! TIMEOUT/ERROR ${requestId} (${elapsed}ms)`);
+      console.error(`[MQTT Approval]     Error: ${error.message}`);
+      console.error(`[MQTT Approval]     Pending requests: ${approvalQueue.getPendingCount()}`);
       return { behavior: 'deny', message: `Approval timeout: ${error.message}` };
     }
   };
@@ -218,10 +232,16 @@ async function handleCommand(payload) {
  * Handle incoming approval response from MQTT
  */
 function handleApprovalResponse(payload) {
-  console.log('[MQTT Bridge] Approval response received:', payload);
+  console.log(`[MQTT Approval] === INCOMING RESPONSE ===`);
+  console.log(`[MQTT Approval]     Full payload:`, JSON.stringify(payload));
+  console.log(`[MQTT Approval]     requestId: ${payload.requestId || 'MISSING!'}`);
+  console.log(`[MQTT Approval]     approved: ${payload.approved}`);
+  console.log(`[MQTT Approval]     reason: ${payload.reason || 'N/A'}`);
+  console.log(`[MQTT Approval]     Pending queue size: ${approvalQueue.getPendingCount()}`);
 
   if (!payload.requestId) {
-    console.warn('[MQTT Bridge] Approval response missing requestId');
+    console.error('[MQTT Approval] !!! Response REJECTED - missing requestId');
+    console.error('[MQTT Approval]     Hint: HA automation must include requestId from input_text.claude_approval_request_id');
     return;
   }
 
@@ -232,7 +252,10 @@ function handleApprovalResponse(payload) {
   );
 
   if (!matched) {
-    console.warn(`[MQTT Bridge] No pending request for ${payload.requestId}`);
+    console.error(`[MQTT Approval] !!! Response ORPHANED - no pending request for ${payload.requestId}`);
+    console.error(`[MQTT Approval]     Possible causes: timeout already occurred, or requestId mismatch`);
+  } else {
+    console.log(`[MQTT Approval] ✓ Response MATCHED and delivered for ${payload.requestId}`);
   }
 }
 
