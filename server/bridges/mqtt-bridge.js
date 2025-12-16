@@ -49,7 +49,19 @@ class MQTTResponseWriter {
     const message = typeof data === 'string' ? JSON.parse(data) : data;
 
     if (this.streaming) {
-      // Publish each chunk immediately
+      // Check if this is a result message with answer text
+      const innerData = message?.data;
+      if (innerData?.type === 'result' && innerData?.result) {
+        // Publish simplified answer message for voice assistants
+        this.client.publish(this.topic, JSON.stringify({
+          type: 'answer',
+          text: innerData.result,
+          session_id: this.sessionId,
+          source_device: this.sourceDevice,
+          timestamp: Date.now()
+        }));
+      }
+      // Also publish full chunk for debugging/other consumers
       this.client.publish(this.topic, JSON.stringify({
         type: 'chunk',
         content: message,
