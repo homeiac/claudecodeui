@@ -79,8 +79,8 @@ for i in {1..30}; do
         echo "=== Approval Response (from HA) ==="
         grep "approval-response" "$MQTT_LOG" | cut -d' ' -f2- | jq '.'
 
-        RESPONSE_ID=$(grep "approval-response" "$MQTT_LOG" | cut -d' ' -f2- | jq -r '.requestId')
-        APPROVED=$(grep "approval-response" "$MQTT_LOG" | cut -d' ' -f2- | jq -r '.approved')
+        RESPONSE_ID=$(grep "approval-response" "$MQTT_LOG" | tail -1 | cut -d' ' -f2- | jq -r '.requestId')
+        APPROVED=$(grep "approval-response" "$MQTT_LOG" | tail -1 | cut -d' ' -f2- | jq -r '.approved')
 
         echo ""
         if [[ "$RESPONSE_ID" == "$REQUEST_ID" ]]; then
