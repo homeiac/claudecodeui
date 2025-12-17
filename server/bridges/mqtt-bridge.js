@@ -177,10 +177,39 @@ function publishError(sessionId, sourceDevice, error) {
 // Track active command to prevent race conditions
 let activeCommand = null;
 
+// Message deduplication - track recent messages to prevent duplicate processing
+const recentMessages = new Map();
+const DEDUPE_WINDOW_MS = 5000; // 5 second window
+
+function isDuplicateMessage(payload) {
+  const key = `${payload.source || ''}-${payload.message || ''}`;
+  const now = Date.now();
+
+  // Clean old entries
+  for (const [k, timestamp] of recentMessages) {
+    if (now - timestamp > DEDUPE_WINDOW_MS) {
+      recentMessages.delete(k);
+    }
+  }
+
+  if (recentMessages.has(key)) {
+    console.log(`[MQTT Bridge] Duplicate message detected, skipping`);
+    return true;
+  }
+
+  recentMessages.set(key, now);
+  return false;
+}
+
 /**
  * Handle incoming command from MQTT
  */
 async function handleCommand(payload) {
+  // Skip duplicate messages (MQTT delivery bug workaround)
+  if (isDuplicateMessage(payload)) {
+    return;
+  }
+
   const sessionId = payload.session_id || approvalQueue.generateRequestId();
   const sourceDevice = payload.source || 'unknown';
 
