@@ -53,7 +53,7 @@ for i in {1..30}; do
         echo "=== Approval Request ==="
         grep "approval-request" "$MQTT_LOG" | cut -d' ' -f2- | jq '.'
 
-        REQUEST_ID=$(grep "approval-request" "$MQTT_LOG" | cut -d' ' -f2- | jq -r '.requestId')
+        REQUEST_ID=$(grep "approval-request" "$MQTT_LOG" | tail -1 | cut -d' ' -f2- | jq -r '.requestId')
         echo ""
         echo "RequestId: $REQUEST_ID"
         echo ""
