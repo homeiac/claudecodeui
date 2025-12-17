@@ -174,6 +174,9 @@ function publishError(sessionId, sourceDevice, error) {
   }));
 }
 
+// Track active command to prevent race conditions
+let activeCommand = null;
+
 /**
  * Handle incoming command from MQTT
  */
@@ -182,6 +185,18 @@ async function handleCommand(payload) {
   const sourceDevice = payload.source || 'unknown';
 
   console.log(`[MQTT Bridge] Received command from ${sourceDevice}:`, payload.message?.substring(0, 100));
+
+  // Cancel any previous pending approval requests to prevent race conditions
+  if (approvalQueue.getPendingCount() > 0) {
+    console.log(`[MQTT Bridge] Cancelling ${approvalQueue.getPendingCount()} pending approval requests`);
+    approvalQueue.cancelAll('New command received');
+  }
+
+  // Track this command as active
+  if (activeCommand) {
+    console.log(`[MQTT Bridge] Previous command still running, will proceed anyway`);
+  }
+  activeCommand = { sessionId, sourceDevice, startTime: Date.now() };
 
   try {
     // Validate required fields
@@ -221,10 +236,12 @@ async function handleCommand(payload) {
 
     // Signal completion
     writer.end();
+    activeCommand = null;
 
   } catch (error) {
     console.error('[MQTT Bridge] Error handling command:', error);
     publishError(sessionId, sourceDevice, error);
+    activeCommand = null;
   }
 }
 
