@@ -1,8 +1,21 @@
 #!/bin/bash
 # Run ClaudeCodeUI locally for debugging
+# Usage: ./run-local.sh [--build] [--test]
+#   --build  Force rebuild image
+#   --test   Use test/ topic prefix (doesn't affect prod)
 set -e
 
 cd "$(dirname "$0")/.."
+
+# Parse args
+BUILD=false
+TEST_MODE=false
+for arg in "$@"; do
+    case $arg in
+        --build) BUILD=true ;;
+        --test) TEST_MODE=true ;;
+    esac
+done
 
 # Get MQTT credentials from K8s secret
 echo "=== Getting MQTT credentials from K8s ==="
@@ -14,10 +27,19 @@ echo "   User: $MQTT_USER"
 docker stop claudecodeui-local 2>/dev/null || true
 
 # Build if needed
-if [[ "$1" == "--build" ]] || [[ -z "$(docker images -q claudecodeui:local 2>/dev/null)" ]]; then
+if [[ "$BUILD" == "true" ]] || [[ -z "$(docker images -q claudecodeui:local 2>/dev/null)" ]]; then
     echo ""
     echo "=== Building local image ==="
     docker build -t claudecodeui:local .
+fi
+
+# Set topic prefix for test mode
+TOPIC_PREFIX=""
+if [[ "$TEST_MODE" == "true" ]]; then
+    TOPIC_PREFIX="test/"
+    echo ""
+    echo "=== TEST MODE: Using topic prefix 'test/' ==="
+    echo "   Topics: test/claude/command, test/claude/home/response, etc."
 fi
 
 echo ""
@@ -29,6 +51,10 @@ docker run --rm -d \
     -e MQTT_BROKER_URL=mqtt://homeassistant.maas:1883 \
     -e MQTT_USERNAME="$MQTT_USER" \
     -e MQTT_PASSWORD="$MQTT_PASS" \
+    -e MQTT_COMMAND_TOPIC="${TOPIC_PREFIX}claude/command" \
+    -e MQTT_RESPONSE_TOPIC="${TOPIC_PREFIX}claude/home/response" \
+    -e MQTT_APPROVAL_REQUEST_TOPIC="${TOPIC_PREFIX}claude/approval-request" \
+    -e MQTT_APPROVAL_RESPONSE_TOPIC="${TOPIC_PREFIX}claude/approval-response" \
     -e KUBECONFIG=/home/claude/kubeconfig \
     -v ~/.claude:/home/claude/.claude \
     -v ~/kubeconfig:/home/claude/kubeconfig:ro \

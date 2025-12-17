@@ -1,5 +1,9 @@
 #!/bin/bash
 # Test MQTT connection and Claude command/response
+# Usage: ./test-mqtt.sh [--test] [--approval] [--simple]
+#   --test     Use test/ topic prefix (for local testing, doesn't affect prod)
+#   --approval Test approval workflow
+#   --simple   Simple TTS test
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,24 +14,40 @@ if [[ -f "$ENV_FILE" ]]; then
     export $(grep -v '^#' "$ENV_FILE" | xargs)
 fi
 
+# Parse args for --test flag
+TOPIC_PREFIX=""
+for arg in "$@"; do
+    if [[ "$arg" == "--test" ]]; then
+        TOPIC_PREFIX="test/"
+        echo "=== TEST MODE: Using topic prefix 'test/' ==="
+    fi
+done
+
 # Parse broker URL
 MQTT_HOST="${MQTT_BROKER_URL#mqtt://}"
 MQTT_HOST="${MQTT_HOST%:*}"
 MQTT_HOST="${MQTT_HOST:-homeassistant.maas}"
 MQTT_PORT="${MQTT_PORT:-1883}"
-MQTT_USER="${MQTT_USERNAME:-$1}"
-MQTT_PASS="${MQTT_PASSWORD:-$2}"
+MQTT_USER="${MQTT_USERNAME}"
+MQTT_PASS="${MQTT_PASSWORD}"
 
 if [[ -z "$MQTT_USER" || -z "$MQTT_PASS" ]]; then
-    echo "Usage: $0 [username] [password]"
+    echo "Usage: $0 [--test] [--approval] [--simple]"
     echo ""
-    echo "Or set MQTT_USERNAME and MQTT_PASSWORD in .env"
+    echo "Set MQTT_USERNAME and MQTT_PASSWORD in .env"
     exit 1
 fi
+
+# Topic configuration
+COMMAND_TOPIC="${TOPIC_PREFIX}claude/command"
+RESPONSE_TOPIC="${TOPIC_PREFIX}claude/home/response"
+APPROVAL_REQUEST_TOPIC="${TOPIC_PREFIX}claude/approval-request"
+APPROVAL_RESPONSE_TOPIC="${TOPIC_PREFIX}claude/approval-response"
 
 echo "=== Testing MQTT Connection ==="
 echo "Host: $MQTT_HOST"
 echo "User: $MQTT_USER"
+echo "Topics: ${TOPIC_PREFIX}claude/*"
 echo ""
 
 # Check if mosquitto_pub/sub are available
@@ -40,7 +60,7 @@ fi
 echo "1. Testing publish..."
 mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
     -u "$MQTT_USER" -P "$MQTT_PASS" \
-    -t "claude/test" -m "test-$(date +%s)" && echo "   OK" || { echo "   FAILED"; exit 1; }
+    -t "${TOPIC_PREFIX}claude/test" -m "test-$(date +%s)" && echo "   OK" || { echo "   FAILED"; exit 1; }
 
 # Test 2: Subscribe to response and send command (skip if --approval-only)
 if [[ "$1" != "--approval-only" && "$2" != "--approval-only" ]]; then
@@ -56,7 +76,7 @@ RESPONSE_FILE=$(mktemp)
 echo "   Subscribing to claude/home/response (${TIMEOUT}s timeout, ${MSG_COUNT} messages max)..."
 mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" \
     -u "$MQTT_USER" -P "$MQTT_PASS" \
-    -t "claude/home/response" -C "$MSG_COUNT" -W "$TIMEOUT" > "$RESPONSE_FILE" 2>/dev/null &
+    -t "$RESPONSE_TOPIC" -C "$MSG_COUNT" -W "$TIMEOUT" > "$RESPONSE_FILE" 2>/dev/null &
 SUB_PID=$!
 sleep 1
 
@@ -64,7 +84,7 @@ sleep 1
 echo "   Sending: What is 2+2? Reply with just the number."
 mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
     -u "$MQTT_USER" -P "$MQTT_PASS" \
-    -t "claude/command" \
+    -t "$COMMAND_TOPIC" \
     -m '{"source":"test-script","message":"What is 2+2? Reply with just the number.","stream":false}'
 
 # Wait for response
@@ -117,7 +137,7 @@ if [[ "$1" == "--approval"* || "$2" == "--approval"* || "$3" == "--approval"* ]]
     echo "   Subscribing to claude/# (30s timeout)..."
     mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" \
         -u "$MQTT_USER" -P "$MQTT_PASS" \
-        -t "claude/#" -v -W 30 > "$APPROVAL_FILE" 2>/dev/null &
+        -t "${TOPIC_PREFIX}claude/#" -v -W 30 > "$APPROVAL_FILE" 2>/dev/null &
     SUB_PID=$!
     sleep 1
 
@@ -125,7 +145,7 @@ if [[ "$1" == "--approval"* || "$2" == "--approval"* || "$3" == "--approval"* ]]
     echo "   Sending: delete /tmp/test-approval-file.txt"
     mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
         -u "$MQTT_USER" -P "$MQTT_PASS" \
-        -t "claude/command" \
+        -t "$COMMAND_TOPIC" \
         -m '{"source":"test-script","message":"delete the file /tmp/test-approval-file.txt using rm command","stream":true}'
 
     # Monitor for approval-request and auto-approve (unit test - no HA dependency)
@@ -150,7 +170,7 @@ if [[ "$1" == "--approval"* || "$2" == "--approval"* || "$3" == "--approval"* ]]
 
                 mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
                     -u "$MQTT_USER" -P "$MQTT_PASS" \
-                    -t "claude/approval-response" \
+                    -t "$APPROVAL_RESPONSE_TOPIC" \
                     -m "{\"requestId\":\"$REQUEST_ID\",\"approved\":true}"
                 echo "   ✓ Sent approval to claude/approval-response"
                 break
@@ -185,7 +205,7 @@ if [[ "$1" == "--simple" || "$2" == "--simple" || "$3" == "--simple" ]]; then
     echo "4. Simple TTS test (streaming)..."
     mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
         -u "$MQTT_USER" -P "$MQTT_PASS" \
-        -t "claude/command" \
+        -t "$COMMAND_TOPIC" \
         -m '{"source":"test-script","message":"What is 2+2? Reply with just the number.","stream":true}'
     echo "   Sent with stream:true - listen for TTS on Voice PE"
     sleep 5
