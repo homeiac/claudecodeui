@@ -102,29 +102,31 @@ async function spawnCursor(command, options = {}, ws) {
                   // Send session-created event only once for new sessions
                   if (!sessionId && !sessionCreatedSent) {
                     sessionCreatedSent = true;
-                    ws.send(JSON.stringify({
+                    ws.send({
                       type: 'session-created',
                       sessionId: capturedSessionId,
                       model: response.model,
                       cwd: response.cwd
-                    }));
+                    });
                   }
                 }
                 
                 // Send system info to frontend
-                ws.send(JSON.stringify({
+                ws.send({
                   type: 'cursor-system',
-                  data: response
-                }));
+                  data: response,
+                  sessionId: capturedSessionId || sessionId || null
+                });
               }
               break;
               
             case 'user':
               // Forward user message
-              ws.send(JSON.stringify({
+              ws.send({
                 type: 'cursor-user',
-                data: response
-              }));
+                data: response,
+                sessionId: capturedSessionId || sessionId || null
+              });
               break;
               
             case 'assistant':
@@ -134,7 +136,7 @@ async function spawnCursor(command, options = {}, ws) {
                 messageBuffer += textContent;
                 
                 // Send as Claude-compatible format for frontend
-                ws.send(JSON.stringify({
+                ws.send({
                   type: 'claude-response',
                   data: {
                     type: 'content_block_delta',
@@ -142,8 +144,9 @@ async function spawnCursor(command, options = {}, ws) {
                       type: 'text_delta',
                       text: textContent
                     }
-                  }
-                }));
+                  },
+                  sessionId: capturedSessionId || sessionId || null
+                });
               }
               break;
               
@@ -153,37 +156,40 @@ async function spawnCursor(command, options = {}, ws) {
               
               // Send final message if we have buffered content
               if (messageBuffer) {
-                ws.send(JSON.stringify({
+                ws.send({
                   type: 'claude-response',
                   data: {
                     type: 'content_block_stop'
-                  }
-                }));
+                  },
+                  sessionId: capturedSessionId || sessionId || null
+                });
               }
               
               // Send completion event
-              ws.send(JSON.stringify({
+              ws.send({
                 type: 'cursor-result',
                 sessionId: capturedSessionId || sessionId,
                 data: response,
                 success: response.subtype === 'success'
-              }));
+              });
               break;
               
             default:
               // Forward any other message types
-              ws.send(JSON.stringify({
+              ws.send({
                 type: 'cursor-response',
-                data: response
-              }));
+                data: response,
+                sessionId: capturedSessionId || sessionId || null
+              });
           }
         } catch (parseError) {
           console.log('📄 Non-JSON response:', line);
           // If not JSON, send as raw text
-          ws.send(JSON.stringify({
+          ws.send({
             type: 'cursor-output',
-            data: line
-          }));
+            data: line,
+            sessionId: capturedSessionId || sessionId || null
+          });
         }
       }
     });
@@ -191,10 +197,11 @@ async function spawnCursor(command, options = {}, ws) {
     // Handle stderr
     cursorProcess.stderr.on('data', (data) => {
       console.error('Cursor CLI stderr:', data.toString());
-      ws.send(JSON.stringify({
+      ws.send({
         type: 'cursor-error',
-        error: data.toString()
-      }));
+        error: data.toString(),
+        sessionId: capturedSessionId || sessionId || null
+      });
     });
     
     // Handle process completion
@@ -205,12 +212,12 @@ async function spawnCursor(command, options = {}, ws) {
       const finalSessionId = capturedSessionId || sessionId || processKey;
       activeCursorProcesses.delete(finalSessionId);
 
-      ws.send(JSON.stringify({
+      ws.send({
         type: 'claude-complete',
         sessionId: finalSessionId,
         exitCode: code,
         isNewSession: !sessionId && !!command // Flag to indicate this was a new session
-      }));
+      });
       
       if (code === 0) {
         resolve();
@@ -226,12 +233,13 @@ async function spawnCursor(command, options = {}, ws) {
       // Clean up process reference on error
       const finalSessionId = capturedSessionId || sessionId || processKey;
       activeCursorProcesses.delete(finalSessionId);
-      
-      ws.send(JSON.stringify({
+
+      ws.send({
         type: 'cursor-error',
-        error: error.message
-      }));
-      
+        error: error.message,
+        sessionId: capturedSessionId || sessionId || null
+      });
+
       reject(error);
     });
     

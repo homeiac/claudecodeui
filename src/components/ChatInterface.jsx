@@ -16,25 +16,34 @@
  * This ensures uninterrupted chat experience by coordinating with App.jsx to pause sidebar updates.
  */
 
-import React, { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useDropzone } from 'react-dropzone';
 import TodoList from './TodoList';
 import ClaudeLogo from './ClaudeLogo.jsx';
 import CursorLogo from './CursorLogo.jsx';
+import CodexLogo from './CodexLogo.jsx';
 import NextTaskBanner from './NextTaskBanner.jsx';
 import { useTasksSettings } from '../contexts/TasksSettingsContext';
+import { useTranslation } from 'react-i18next';
 
 import ClaudeStatus from './ClaudeStatus';
 import TokenUsagePie from './TokenUsagePie';
 import { MicButton } from './MicButton.jsx';
 import { api, authenticatedFetch } from '../utils/api';
+import ThinkingModeSelector, { thinkingModes } from './ThinkingModeSelector.jsx';
 import Fuse from 'fuse.js';
 import CommandMenu from './CommandMenu';
+import { CLAUDE_MODELS, CURSOR_MODELS, CODEX_MODELS } from '../../shared/modelConstants';
 
+import { safeJsonParse } from '../lib/utils.js';
+
+// ! Move all utility functions to utils/chatUtils.ts
 
 // Helper function to decode HTML entities in text
 function decodeHtmlEntities(text) {
@@ -88,6 +97,10 @@ function unescapeWithMathProtection(text) {
   );
 
   return processedText;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // Small wrapper to keep markdown behavior consistent in one place
@@ -234,26 +247,128 @@ const safeLocalStorage = {
   }
 };
 
+const CLAUDE_SETTINGS_KEY = 'claude-settings';
+
+
+function getClaudeSettings() {
+  const raw = safeLocalStorage.getItem(CLAUDE_SETTINGS_KEY);
+  if (!raw) {
+    return {
+      allowedTools: [],
+      disallowedTools: [],
+      skipPermissions: false,
+      projectSortOrder: 'name'
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      ...parsed,
+      allowedTools: Array.isArray(parsed.allowedTools) ? parsed.allowedTools : [],
+      disallowedTools: Array.isArray(parsed.disallowedTools) ? parsed.disallowedTools : [],
+      skipPermissions: Boolean(parsed.skipPermissions),
+      projectSortOrder: parsed.projectSortOrder || 'name'
+    };
+  } catch {
+    return {
+      allowedTools: [],
+      disallowedTools: [],
+      skipPermissions: false,
+      projectSortOrder: 'name'
+    };
+  }
+}
+
+function buildClaudeToolPermissionEntry(toolName, toolInput) {
+  if (!toolName) return null;
+  if (toolName !== 'Bash') return toolName;
+
+  const parsed = safeJsonParse(toolInput);
+  const command = typeof parsed?.command === 'string' ? parsed.command.trim() : '';
+  if (!command) return toolName;
+
+  const tokens = command.split(/\s+/);
+  if (tokens.length === 0) return toolName;
+
+  // For Bash, allow the command family instead of every Bash invocation.
+  if (tokens[0] === 'git' && tokens[1]) {
+    return `Bash(${tokens[0]} ${tokens[1]}:*)`;
+  }
+  return `Bash(${tokens[0]}:*)`;
+}
+
+// Normalize tool inputs for display in the permission banner.
+// This does not sanitize/redact secrets; it is strictly formatting so users
+// can see the raw input that triggered the permission prompt.
+function formatToolInputForDisplay(input) {
+  if (input === undefined || input === null) return '';
+  if (typeof input === 'string') return input;
+  try {
+    return JSON.stringify(input, null, 2);
+  } catch {
+    return String(input);
+  }
+}
+
+function getClaudePermissionSuggestion(message, provider) {
+  if (provider !== 'claude') return null;
+  if (!message?.toolResult?.isError) return null;
+
+  const toolName = message?.toolName;
+  const entry = buildClaudeToolPermissionEntry(toolName, message.toolInput);
+
+  if (!entry) return null;
+
+  const settings = getClaudeSettings();
+  const isAllowed = settings.allowedTools.includes(entry);
+  return { toolName, entry, isAllowed };
+}
+
+function grantClaudeToolPermission(entry) {
+  if (!entry) return { success: false };
+
+  const settings = getClaudeSettings();
+  const alreadyAllowed = settings.allowedTools.includes(entry);
+  const nextAllowed = alreadyAllowed ? settings.allowedTools : [...settings.allowedTools, entry];
+  const nextDisallowed = settings.disallowedTools.filter(tool => tool !== entry);
+  const updatedSettings = {
+    ...settings,
+    allowedTools: nextAllowed,
+    disallowedTools: nextDisallowed,
+    lastUpdated: new Date().toISOString()
+  };
+
+  safeLocalStorage.setItem(CLAUDE_SETTINGS_KEY, JSON.stringify(updatedSettings));
+  return { success: true, alreadyAllowed, updatedSettings };
+}
+
 // Common markdown components to ensure consistent rendering (tables, inline code, links, etc.)
-const markdownComponents = {
-  code: ({ node, inline, className, children, ...props }) => {
-    const [copied, setCopied] = React.useState(false);
-    const raw = Array.isArray(children) ? children.join('') : String(children ?? '');
-    const looksMultiline = /[\r\n]/.test(raw);
-    const inlineDetected = inline || (node && node.type === 'inlineCode');
-    const shouldInline = inlineDetected || !looksMultiline; // fallback to inline if single-line
-    if (shouldInline) {
-      return (
-        <code
-          className={`font-mono text-[0.9em] px-1.5 py-0.5 rounded-md bg-gray-100 text-gray-900 border border-gray-200 dark:bg-gray-800/60 dark:text-gray-100 dark:border-gray-700 whitespace-pre-wrap break-words ${
-            className || ''
-          }`}
-          {...props}
-        >
-          {children}
-        </code>
-      );
-    }
+const CodeBlock = ({ node, inline, className, children, ...props }) => {
+  const { t } = useTranslation('chat');
+  const [copied, setCopied] = React.useState(false);
+  const raw = Array.isArray(children) ? children.join('') : String(children ?? '');
+  const looksMultiline = /[\r\n]/.test(raw);
+  const inlineDetected = inline || (node && node.type === 'inlineCode');
+  const shouldInline = inlineDetected || !looksMultiline; // fallback to inline if single-line
+
+  // Inline code rendering
+  if (shouldInline) {
+    return (
+      <code
+        className={`font-mono text-[0.9em] px-1.5 py-0.5 rounded-md bg-gray-100 text-gray-900 border border-gray-200 dark:bg-gray-800/60 dark:text-gray-100 dark:border-gray-700 whitespace-pre-wrap break-words ${
+          className || ''
+        }`}
+        {...props}
+      >
+        {children}
+      </code>
+    );
+  }
+
+    // Extract language from className (format: language-xxx)
+    const match = /language-(\w+)/.exec(className || '');
+    const language = match ? match[1] : 'text';
     const textToCopy = raw;
 
     const handleCopy = () => {
@@ -289,21 +404,30 @@ const markdownComponents = {
       } catch {}
     };
 
+    // Code block with syntax highlighting
     return (
       <div className="relative group my-2">
+        {/* Language label */}
+        {language && language !== 'text' && (
+          <div className="absolute top-2 left-3 z-10 text-xs text-gray-400 font-medium uppercase">
+            {language}
+          </div>
+        )}
+
+        {/* Copy button */}
         <button
           type="button"
           onClick={handleCopy}
           className="absolute top-2 right-2 z-10 opacity-0 group-hover:opacity-100 focus:opacity-100 active:opacity-100 transition-opacity text-xs px-2 py-1 rounded-md bg-gray-700/80 hover:bg-gray-700 text-white border border-gray-600"
-          title={copied ? 'Copied' : 'Copy code'}
-          aria-label={copied ? 'Copied' : 'Copy code'}
+          title={copied ? t('codeBlock.copied') : t('codeBlock.copyCode')}
+          aria-label={copied ? t('codeBlock.copied') : t('codeBlock.copyCode')}
         >
           {copied ? (
             <span className="flex items-center gap-1">
               <svg className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
                 <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
               </svg>
-              Copied
+              {t('codeBlock.copied')}
             </span>
           ) : (
             <span className="flex items-center gap-1">
@@ -311,18 +435,36 @@ const markdownComponents = {
                 <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                 <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"></path>
               </svg>
-              Copy
+              {t('codeBlock.copy')}
             </span>
           )}
         </button>
-        <pre className="bg-gray-900 dark:bg-gray-900 border border-gray-700/40 rounded-lg p-3 overflow-x-auto">
-          <code className={`text-gray-100 dark:text-gray-100 text-sm font-mono ${className || ''}`} {...props}>
-            {children}
-          </code>
-        </pre>
+
+        {/* Syntax highlighted code */}
+        <SyntaxHighlighter
+          language={language}
+          style={oneDark}
+          customStyle={{
+            margin: 0,
+            borderRadius: '0.5rem',
+            fontSize: '0.875rem',
+            padding: language && language !== 'text' ? '2rem 1rem 1rem 1rem' : '1rem',
+          }}
+          codeTagProps={{
+            style: {
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+            }
+          }}
+        >
+          {raw}
+        </SyntaxHighlighter>
       </div>
     );
-  },
+  };
+
+// Common markdown components to ensure consistent rendering (tables, inline code, links, etc.)
+const markdownComponents = {
+  code: CodeBlock,
   blockquote: ({ children }) => (
     <blockquote className="border-l-4 border-gray-300 dark:border-gray-600 pl-4 italic text-gray-600 dark:text-gray-400 my-2">
       {children}
@@ -354,7 +496,8 @@ const markdownComponents = {
 };
 
 // Memoized message component to prevent unnecessary re-renders
-const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFileOpen, onShowSettings, autoExpandTools, showRawParameters, showThinking, selectedProject }) => {
+const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFileOpen, onShowSettings, onGrantToolPermission, autoExpandTools, showRawParameters, showThinking, selectedProject, provider }) => {
+  const { t } = useTranslation('chat');
   const isGrouped = prevMessage && prevMessage.type === message.type &&
                    ((prevMessage.type === 'assistant') ||
                     (prevMessage.type === 'user') ||
@@ -362,6 +505,13 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                     (prevMessage.type === 'error'));
   const messageRef = React.useRef(null);
   const [isExpanded, setIsExpanded] = React.useState(false);
+  const permissionSuggestion = getClaudePermissionSuggestion(message, provider);
+  const [permissionGrantState, setPermissionGrantState] = React.useState('idle');
+
+  React.useEffect(() => {
+    setPermissionGrantState('idle');
+  }, [permissionSuggestion?.entry, message.toolId]);
+
   React.useEffect(() => {
     if (!autoExpandTools || !messageRef.current || !message.isToolUse) return;
     
@@ -442,13 +592,15 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                 <div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0 p-1">
                   {(localStorage.getItem('selected-provider') || 'claude') === 'cursor' ? (
                     <CursorLogo className="w-full h-full" />
+                  ) : (localStorage.getItem('selected-provider') || 'claude') === 'codex' ? (
+                    <CodexLogo className="w-full h-full" />
                   ) : (
                     <ClaudeLogo className="w-full h-full" />
                   )}
                 </div>
               )}
               <div className="text-sm font-medium text-gray-900 dark:text-white">
-                {message.type === 'error' ? 'Error' : message.type === 'tool' ? 'Tool' : ((localStorage.getItem('selected-provider') || 'claude') === 'cursor' ? 'Cursor' : 'Claude')}
+                {message.type === 'error' ? t('messageTypes.error') : message.type === 'tool' ? t('messageTypes.tool') : ((localStorage.getItem('selected-provider') || 'claude') === 'cursor' ? t('messageTypes.cursor') : (localStorage.getItem('selected-provider') || 'claude') === 'codex' ? t('messageTypes.codex') : t('messageTypes.claude'))}
               </div>
             </div>
           )}
@@ -476,8 +628,8 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                                 const input = JSON.parse(message.toolInput);
                                 return (
                                   <span className="font-mono truncate flex-1 min-w-0">
-                                    {input.pattern && <span>pattern: <span className="text-blue-600 dark:text-blue-400">{input.pattern}</span></span>}
-                                    {input.path && <span className="ml-2">in: {input.path}</span>}
+                                    {input.pattern && <span>{t('search.pattern')} <span className="text-blue-600 dark:text-blue-400">{input.pattern}</span></span>}
+                                    {input.path && <span className="ml-2">{t('search.in')} {input.path}</span>}
                                   </span>
                                 );
                               } catch (e) {
@@ -490,7 +642,7 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                               href={`#tool-result-${message.toolId}`}
                               className="flex-shrink-0 text-xs text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 font-medium transition-colors flex items-center gap-1"
                             >
-                              <span>results</span>
+                              <span>{t('tools.searchResults')}</span>
                               <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                               </svg>
@@ -534,7 +686,7 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                         onShowSettings();
                       }}
                       className="p-2 rounded-lg hover:bg-white/60 dark:hover:bg-gray-800/60 transition-all duration-200 group/btn backdrop-blur-sm"
-                      title="Tool Settings"
+                      title={t('tools.settings')}
                     >
                       <svg className="w-4 h-4 text-gray-600 dark:text-gray-400 group-hover/btn:text-blue-600 dark:group-hover/btn:text-blue-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -1354,6 +1506,59 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                           </Markdown>
                         );
                       })()}
+                      {permissionSuggestion && (
+                        <div className="mt-4 border-t border-red-200/60 dark:border-red-800/60 pt-3">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!onGrantToolPermission) return;
+                                const result = onGrantToolPermission(permissionSuggestion);
+                                if (result?.success) {
+                                  setPermissionGrantState('granted');
+                                } else {
+                                  setPermissionGrantState('error');
+                                }
+                              }}
+                              disabled={permissionSuggestion.isAllowed || permissionGrantState === 'granted'}
+                              className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors ${
+                                permissionSuggestion.isAllowed || permissionGrantState === 'granted'
+                                  ? 'bg-green-100 dark:bg-green-900/30 border-green-300/70 dark:border-green-800/60 text-green-800 dark:text-green-200 cursor-default'
+                                  : 'bg-white/80 dark:bg-gray-900/40 border-red-300/70 dark:border-red-800/60 text-red-700 dark:text-red-200 hover:bg-white dark:hover:bg-gray-900/70'
+                              }`}
+                            >
+                              {permissionSuggestion.isAllowed || permissionGrantState === 'granted'
+                                ? 'Permission added'
+                                : `Grant permission for ${permissionSuggestion.toolName}`}
+                            </button>
+                            {onShowSettings && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onShowSettings();
+                                }}
+                                className="text-xs text-red-700 dark:text-red-200 underline hover:text-red-800 dark:hover:text-red-100"
+                              >
+                                Open settings
+                              </button>
+                            )}
+                          </div>
+                          <div className="mt-2 text-xs text-red-700/90 dark:text-red-200/80">
+                            Adds <span className="font-mono">{permissionSuggestion.entry}</span> to Allowed Tools.
+                          </div>
+                          {permissionGrantState === 'error' && (
+                            <div className="mt-2 text-xs text-red-700 dark:text-red-200">
+                              Unable to update permissions. Please try again.
+                            </div>
+                          )}
+                          {(permissionSuggestion.isAllowed || permissionGrantState === 'granted') && (
+                            <div className="mt-2 text-xs text-green-700 dark:text-green-200">
+                              Permission saved. Retry the request to use the tool.
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                   );
@@ -1522,6 +1727,23 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                   <span className="font-medium">Read todo list</span>
                 </div>
               </div>
+            ) : message.isThinking ? (
+              /* Thinking messages - collapsible by default */
+              <div className="text-sm text-gray-700 dark:text-gray-300">
+                <details className="group">
+                  <summary className="cursor-pointer text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 font-medium flex items-center gap-2">
+                    <svg className="w-3 h-3 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                    <span>💭 Thinking...</span>
+                  </summary>
+                  <div className="mt-2 pl-4 border-l-2 border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 text-sm">
+                    <Markdown className="prose prose-sm max-w-none dark:prose-invert prose-gray">
+                      {message.content}
+                    </Markdown>
+                  </div>
+                </details>
+              </div>
             ) : (
               <div className="text-sm text-gray-700 dark:text-gray-300">
                 {/* Thinking accordion for reasoning */}
@@ -1537,7 +1759,7 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                     </div>
                   </details>
                 )}
-                
+
                 {(() => {
                   const content = formatUsageLimitText(String(message.content || ''));
 
@@ -1640,8 +1862,9 @@ const ImageAttachment = ({ file, onRemove, uploadProgress, error }) => {
 // - onReplaceTemporarySession: Called to replace temporary session ID with real WebSocket session ID
 //
 // This ensures uninterrupted chat experience by pausing sidebar refreshes during conversations.
-function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, messages, onFileOpen, onInputFocusChange, onSessionActive, onSessionInactive, onSessionProcessing, onSessionNotProcessing, processingSessions, onReplaceTemporarySession, onNavigateToSession, onShowSettings, autoExpandTools, showRawParameters, showThinking, autoScrollToBottom, sendByCtrlEnter, externalMessageUpdate, onTaskClick, onShowAllTasks }) {
-  const { tasksEnabled } = useTasksSettings();
+function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, latestMessage, onFileOpen, onInputFocusChange, onSessionActive, onSessionInactive, onSessionProcessing, onSessionNotProcessing, processingSessions, onReplaceTemporarySession, onNavigateToSession, onShowSettings, autoExpandTools, showRawParameters, showThinking, autoScrollToBottom, sendByCtrlEnter, externalMessageUpdate, onTaskClick, onShowAllTasks }) {
+  const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
+  const { t } = useTranslation('chat');
   const [input, setInput] = useState(() => {
     if (typeof window !== 'undefined' && selectedProject) {
       return safeLocalStorage.getItem(`draft_input_${selectedProject.name}`) || '';
@@ -1667,21 +1890,33 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
   const MESSAGES_PER_PAGE = 20;
   const [isSystemSessionChange, setIsSystemSessionChange] = useState(false);
   const [permissionMode, setPermissionMode] = useState('default');
+  // In-memory queue of tool permission prompts for the current UI view.
+  // These are not persisted and do not survive a page refresh; introduced so
+  // the UI can present pending approvals while the SDK waits.
+  const [pendingPermissionRequests, setPendingPermissionRequests] = useState([]);
   const [attachedImages, setAttachedImages] = useState([]);
   const [uploadingImages, setUploadingImages] = useState(new Map());
   const [imageErrors, setImageErrors] = useState(new Map());
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
   const inputContainerRef = useRef(null);
+  const inputHighlightRef = useRef(null);
   const scrollContainerRef = useRef(null);
   const isLoadingSessionRef = useRef(false); // Track session loading to prevent multiple scrolls
+  const isLoadingMoreRef = useRef(false);
+  const topLoadLockRef = useRef(false);
+  const pendingScrollRestoreRef = useRef(null);
   // Streaming throttle buffers
   const streamBufferRef = useRef('');
   const streamTimerRef = useRef(null);
+  // Track the session that this view expects when starting a brand‑new chat
+  // (prevents background sessions from streaming into a different view).
+  const pendingViewSessionRef = useRef(null);
   const commandQueryTimerRef = useRef(null);
   const [debouncedInput, setDebouncedInput] = useState('');
   const [showFileDropdown, setShowFileDropdown] = useState(false);
   const [fileList, setFileList] = useState([]);
+  const [fileMentions, setFileMentions] = useState([]);
   const [filteredFiles, setFilteredFiles] = useState([]);
   const [selectedFileIndex, setSelectedFileIndex] = useState(-1);
   const [cursorPosition, setCursorPosition] = useState(0);
@@ -1699,12 +1934,30 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
   const [slashPosition, setSlashPosition] = useState(-1);
   const [visibleMessageCount, setVisibleMessageCount] = useState(100);
   const [claudeStatus, setClaudeStatus] = useState(null);
+  const [thinkingMode, setThinkingMode] = useState('none');
   const [provider, setProvider] = useState(() => {
     return localStorage.getItem('selected-provider') || 'claude';
   });
   const [cursorModel, setCursorModel] = useState(() => {
-    return localStorage.getItem('cursor-model') || 'gpt-5';
+    return localStorage.getItem('cursor-model') || CURSOR_MODELS.DEFAULT;
   });
+  const [claudeModel, setClaudeModel] = useState(() => {
+    return localStorage.getItem('claude-model') || CLAUDE_MODELS.DEFAULT;
+  });
+  const [codexModel, setCodexModel] = useState(() => {
+    return localStorage.getItem('codex-model') || CODEX_MODELS.DEFAULT;
+  });
+  // Track provider transitions so we only clear approvals when provider truly changes.
+  // This does not sync with the backend; it just prevents UI prompts from disappearing.
+  const lastProviderRef = useRef(provider);
+
+  const resetStreamingState = useCallback(() => {
+    if (streamTimerRef.current) {
+      clearTimeout(streamTimerRef.current);
+      streamTimerRef.current = null;
+    }
+    streamBufferRef.current = '';
+  }, []);
   // Load permission mode for the current session
   useEffect(() => {
     if (selectedSession?.id) {
@@ -1724,6 +1977,23 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
       localStorage.setItem('selected-provider', selectedSession.__provider);
     }
   }, [selectedSession]);
+
+  // Clear pending permission prompts when switching providers; filter when switching sessions.
+  // This does not preserve prompts across provider changes; it exists to keep the
+  // Claude approval flow intact while preventing prompts from a different provider.
+  useEffect(() => {
+    if (lastProviderRef.current !== provider) {
+      setPendingPermissionRequests([]);
+      lastProviderRef.current = provider;
+    }
+  }, [provider]);
+
+  // When the selected session changes, drop prompts that belong to other sessions.
+  // This does not attempt to migrate prompts across sessions; it only filters,
+  // introduced so the UI does not show approvals for a session the user is no longer viewing.
+  useEffect(() => {
+    setPendingPermissionRequests(prev => prev.filter(req => !req.sessionId || req.sessionId === selectedSession?.id));
+  }, [selectedSession?.id]);
   
   // Load Cursor default model from config
   useEffect(() => {
@@ -1732,17 +2002,10 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
       .then(res => res.json())
       .then(data => {
         if (data.success && data.config?.model?.modelId) {
-          // Map Cursor model IDs to our simplified names
-          const modelMap = {
-            'gpt-5': 'gpt-5',
-            'claude-4-sonnet': 'sonnet-4',
-            'sonnet-4': 'sonnet-4',
-            'claude-4-opus': 'opus-4.1',
-            'opus-4.1': 'opus-4.1'
-          };
-          const mappedModel = modelMap[data.config.model.modelId] || data.config.model.modelId;
+          // Use the model from config directly
+          const modelId = data.config.model.modelId;
           if (!localStorage.getItem('cursor-model')) {
-            setCursorModel(mappedModel);
+            setCursorModel(modelId);
           }
         }
       })
@@ -2036,7 +2299,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
         projectName: selectedProject.name,
         sessionId: currentSessionId,
         provider,
-        model: provider === 'cursor' ? cursorModel : 'claude-sonnet-4.5',
+        model: provider === 'cursor' ? cursorModel : claudeModel,
         tokenUsage: tokenBudget
       };
 
@@ -2109,24 +2372,29 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
   }, []);
 
   // Load session messages from API with pagination
-  const loadSessionMessages = useCallback(async (projectName, sessionId, loadMore = false) => {
+  const loadSessionMessages = useCallback(async (projectName, sessionId, loadMore = false, provider = 'claude') => {
     if (!projectName || !sessionId) return [];
-    
+
     const isInitialLoad = !loadMore;
     if (isInitialLoad) {
       setIsLoadingSessionMessages(true);
     } else {
       setIsLoadingMoreMessages(true);
     }
-    
+
     try {
       const currentOffset = loadMore ? messagesOffset : 0;
-      const response = await api.sessionMessages(projectName, sessionId, MESSAGES_PER_PAGE, currentOffset);
+      const response = await api.sessionMessages(projectName, sessionId, MESSAGES_PER_PAGE, currentOffset, provider);
       if (!response.ok) {
         throw new Error('Failed to load session messages');
       }
       const data = await response.json();
-      
+
+      // Extract token usage if present (Codex includes it in messages response)
+      if (isInitialLoad && data.tokenUsage) {
+        setTokenBudget(data.tokenUsage);
+      }
+
       // Handle paginated response
       if (data.hasMore !== undefined) {
         setHasMoreMessages(data.hasMore);
@@ -2569,6 +2837,45 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
         }
       }
       
+      // Handle thinking messages (Codex reasoning)
+      else if (msg.type === 'thinking' && msg.message?.content) {
+        converted.push({
+          type: 'assistant',
+          content: unescapeWithMathProtection(msg.message.content),
+          timestamp: msg.timestamp || new Date().toISOString(),
+          isThinking: true
+        });
+      }
+
+      // Handle tool_use messages (Codex function calls)
+      else if (msg.type === 'tool_use' && msg.toolName) {
+        converted.push({
+          type: 'assistant',
+          content: '',
+          timestamp: msg.timestamp || new Date().toISOString(),
+          isToolUse: true,
+          toolName: msg.toolName,
+          toolInput: msg.toolInput || '',
+          toolCallId: msg.toolCallId
+        });
+      }
+
+      // Handle tool_result messages (Codex function outputs)
+      else if (msg.type === 'tool_result') {
+        // Find the matching tool_use by callId, or the last tool_use without a result
+        for (let i = converted.length - 1; i >= 0; i--) {
+          if (converted[i].isToolUse && !converted[i].toolResult) {
+            if (!msg.toolCallId || converted[i].toolCallId === msg.toolCallId) {
+              converted[i].toolResult = {
+                content: msg.output || '',
+                isError: false
+              };
+              break;
+            }
+          }
+        }
+      }
+
       // Handle assistant messages
       else if (msg.message?.role === 'assistant' && msg.message?.content) {
         if (Array.isArray(msg.message.content)) {
@@ -2646,6 +2953,39 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     return scrollHeight - scrollTop - clientHeight < 50;
   }, []);
 
+  const loadOlderMessages = useCallback(async (container) => {
+    if (!container || isLoadingMoreRef.current || isLoadingMoreMessages) return false;
+    if (!hasMoreMessages || !selectedSession || !selectedProject) return false;
+
+    const sessionProvider = selectedSession.__provider || 'claude';
+    if (sessionProvider === 'cursor') return false;
+
+    isLoadingMoreRef.current = true;
+    const previousScrollHeight = container.scrollHeight;
+    const previousScrollTop = container.scrollTop;
+
+    try {
+      const moreMessages = await loadSessionMessages(
+        selectedProject.name,
+        selectedSession.id,
+        true,
+        sessionProvider
+      );
+
+      if (moreMessages.length > 0) {
+        pendingScrollRestoreRef.current = {
+          height: previousScrollHeight,
+          top: previousScrollTop
+        };
+        // Prepend new messages to the existing ones
+        setSessionMessages(prev => [...moreMessages, ...prev]);
+      }
+      return true;
+    } finally {
+      isLoadingMoreRef.current = false;
+    }
+  }, [hasMoreMessages, isLoadingMoreMessages, selectedSession, selectedProject, loadSessionMessages]);
+
   // Handle scroll events to detect when user manually scrolls up and load more messages
   const handleScroll = useCallback(async () => {
     if (scrollContainerRef.current) {
@@ -2655,32 +2995,29 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
       
       // Check if we should load more messages (scrolled near top)
       const scrolledNearTop = container.scrollTop < 100;
-      const provider = localStorage.getItem('selected-provider') || 'claude';
-      
-      if (scrolledNearTop && hasMoreMessages && !isLoadingMoreMessages && selectedSession && selectedProject && provider !== 'cursor') {
-        // Save current scroll position
-        const previousScrollHeight = container.scrollHeight;
-        const previousScrollTop = container.scrollTop;
-        
-        // Load more messages
-        const moreMessages = await loadSessionMessages(selectedProject.name, selectedSession.id, true);
-        
-        if (moreMessages.length > 0) {
-          // Prepend new messages to the existing ones
-          setSessionMessages(prev => [...moreMessages, ...prev]);
-          
-          // Restore scroll position after DOM update
-          setTimeout(() => {
-            if (scrollContainerRef.current) {
-              const newScrollHeight = scrollContainerRef.current.scrollHeight;
-              const scrollDiff = newScrollHeight - previousScrollHeight;
-              scrollContainerRef.current.scrollTop = previousScrollTop + scrollDiff;
-            }
-          }, 0);
+      if (!scrolledNearTop) {
+        topLoadLockRef.current = false;
+      } else if (!topLoadLockRef.current) {
+        const didLoad = await loadOlderMessages(container);
+        if (didLoad) {
+          topLoadLockRef.current = true;
         }
       }
     }
-  }, [isNearBottom, hasMoreMessages, isLoadingMoreMessages, selectedSession, selectedProject, loadSessionMessages]);
+  }, [isNearBottom, loadOlderMessages]);
+
+  // Restore scroll position after paginated messages render
+  useLayoutEffect(() => {
+    if (!pendingScrollRestoreRef.current || !scrollContainerRef.current) return;
+
+    const { height, top } = pendingScrollRestoreRef.current;
+    const container = scrollContainerRef.current;
+    const newScrollHeight = container.scrollHeight;
+    const scrollDiff = newScrollHeight - height;
+
+    container.scrollTop = top + Math.max(scrollDiff, 0);
+    pendingScrollRestoreRef.current = null;
+  }, [chatMessages.length]);
 
   useEffect(() => {
     // Load session messages when session changes
@@ -2695,6 +3032,15 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
         const sessionChanged = currentSessionId !== null && currentSessionId !== selectedSession.id;
 
         if (sessionChanged) {
+          if (!isSystemSessionChange) {
+            // Clear any streaming leftovers from the previous session
+            resetStreamingState();
+            pendingViewSessionRef.current = null;
+            setChatMessages([]);
+            setSessionMessages([]);
+            setClaudeStatus(null);
+            setCanAbortSession(false);
+          }
           // Reset pagination state when switching sessions
           setMessagesOffset(0);
           setHasMoreMessages(false);
@@ -2754,7 +3100,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           // Only load messages from API if this is a user-initiated session change
           // For system-initiated changes, preserve existing messages and rely on WebSocket
           if (!isSystemSessionChange) {
-            const messages = await loadSessionMessages(selectedProject.name, selectedSession.id, false);
+            const messages = await loadSessionMessages(selectedProject.name, selectedSession.id, false, selectedSession.__provider || 'claude');
             setSessionMessages(messages);
             // convertedMessages will be automatically updated via useMemo
             // Scroll will be handled by the main scroll useEffect after messages are rendered
@@ -2764,17 +3110,22 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           }
         }
       } else {
-        // Only clear messages if this is NOT a system-initiated session change AND we're not loading
-        // During system session changes or while loading, preserve the chat messages
-        if (!isSystemSessionChange && !isLoading) {
+        // New session view (no selected session) - always reset UI state
+        if (!isSystemSessionChange) {
+          resetStreamingState();
+          pendingViewSessionRef.current = null;
           setChatMessages([]);
           setSessionMessages([]);
+          setClaudeStatus(null);
+          setCanAbortSession(false);
+          setIsLoading(false);
         }
         setCurrentSessionId(null);
         sessionStorage.removeItem('cursorSessionId');
         setMessagesOffset(0);
         setHasMoreMessages(false);
         setTotalMessages(0);
+        setTokenBudget(null);
       }
 
       // Mark loading as complete after messages are set
@@ -2785,7 +3136,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     };
 
     loadMessages();
-  }, [selectedSession, selectedProject, loadCursorSessionMessages, scrollToBottom, isSystemSessionChange]);
+  }, [selectedSession, selectedProject, loadCursorSessionMessages, scrollToBottom, isSystemSessionChange, resetStreamingState]);
 
   // External Message Update Handler: Reload messages when external CLI modifies current session
   // This triggers when App.jsx detects a JSONL file change for the currently-viewed session
@@ -2803,13 +3154,14 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
             setSessionMessages([]);
             setChatMessages(converted);
           } else {
-            // Reload Claude messages from API/JSONL
-            const messages = await loadSessionMessages(selectedProject.name, selectedSession.id, false);
+            // Reload Claude/Codex messages from API/JSONL
+            const messages = await loadSessionMessages(selectedProject.name, selectedSession.id, false, selectedSession.__provider || 'claude');
             setSessionMessages(messages);
             // convertedMessages will be automatically updated via useMemo
 
             // Smart scroll behavior: only auto-scroll if user is near bottom
-            if (isNearBottom && autoScrollToBottom) {
+            const shouldAutoScroll = autoScrollToBottom && isNearBottom();
+            if (shouldAutoScroll) {
               setTimeout(() => scrollToBottom(), 200);
             }
             // If user scrolled up, preserve their position (they're reading history)
@@ -2822,6 +3174,13 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
       reloadExternalMessages();
     }
   }, [externalMessageUpdate, selectedSession, selectedProject, loadCursorSessionMessages, loadSessionMessages, isNearBottom, autoScrollToBottom, scrollToBottom]);
+
+  // When the user navigates to a specific session, clear any pending "new session" marker.
+  useEffect(() => {
+    if (selectedSession?.id) {
+      pendingViewSessionRef.current = null;
+    }
+  }, [selectedSession?.id]);
 
   // Update chatMessages when convertedMessages changes
   useEffect(() => {
@@ -2885,19 +3244,78 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
 
   useEffect(() => {
     // Handle WebSocket messages
-    if (messages.length > 0) {
-      const latestMessage = messages[messages.length - 1];
+    if (latestMessage) {
+      const messageData = latestMessage.data?.message || latestMessage.data;
 
       // Filter messages by session ID to prevent cross-session interference
       // Skip filtering for global messages that apply to all sessions
-      const globalMessageTypes = ['projects_updated', 'taskmaster-project-updated', 'session-created', 'claude-complete'];
+      const globalMessageTypes = ['projects_updated', 'taskmaster-project-updated', 'session-created'];
       const isGlobalMessage = globalMessageTypes.includes(latestMessage.type);
+      const lifecycleMessageTypes = new Set([
+        'claude-complete',
+        'codex-complete',
+        'cursor-result',
+        'session-aborted',
+        'claude-error',
+        'cursor-error',
+        'codex-error'
+      ]);
 
-      // For new sessions (currentSessionId is null), allow messages through
-      if (!isGlobalMessage && latestMessage.sessionId && currentSessionId && latestMessage.sessionId !== currentSessionId) {
-        // Message is for a different session, ignore it
-        console.log('⏭️ Skipping message for different session:', latestMessage.sessionId, 'current:', currentSessionId);
-        return;
+      const isClaudeSystemInit = latestMessage.type === 'claude-response' &&
+        messageData &&
+        messageData.type === 'system' &&
+        messageData.subtype === 'init';
+      const isCursorSystemInit = latestMessage.type === 'cursor-system' &&
+        latestMessage.data &&
+        latestMessage.data.type === 'system' &&
+        latestMessage.data.subtype === 'init';
+
+      const systemInitSessionId = isClaudeSystemInit
+        ? messageData?.session_id
+        : isCursorSystemInit
+          ? latestMessage.data?.session_id
+          : null;
+
+      const activeViewSessionId = selectedSession?.id || currentSessionId || pendingViewSessionRef.current?.sessionId || null;
+      const isSystemInitForView = systemInitSessionId && (!activeViewSessionId || systemInitSessionId === activeViewSessionId);
+      const shouldBypassSessionFilter = isGlobalMessage || isSystemInitForView;
+      const isUnscopedError = !latestMessage.sessionId &&
+        pendingViewSessionRef.current &&
+        !pendingViewSessionRef.current.sessionId &&
+        (latestMessage.type === 'claude-error' || latestMessage.type === 'cursor-error' || latestMessage.type === 'codex-error');
+
+      const handleBackgroundLifecycle = (sessionId) => {
+        if (!sessionId) return;
+        if (onSessionInactive) {
+          onSessionInactive(sessionId);
+        }
+        if (onSessionNotProcessing) {
+          onSessionNotProcessing(sessionId);
+        }
+      };
+
+      if (!shouldBypassSessionFilter) {
+        if (!activeViewSessionId) {
+          // No session in view; ignore session-scoped traffic.
+          if (latestMessage.sessionId && lifecycleMessageTypes.has(latestMessage.type)) {
+            handleBackgroundLifecycle(latestMessage.sessionId);
+          }
+          if (!isUnscopedError) {
+            return;
+          }
+        }
+        if (!latestMessage.sessionId && !isUnscopedError) {
+          // Drop unscoped messages to prevent cross-session bleed.
+          return;
+        }
+        if (latestMessage.sessionId !== activeViewSessionId) {
+          if (latestMessage.sessionId && lifecycleMessageTypes.has(latestMessage.type)) {
+            handleBackgroundLifecycle(latestMessage.sessionId);
+          }
+          // Message is for a different session, ignore it
+          console.log('??-?,? Skipping message for different session:', latestMessage.sessionId, 'current:', activeViewSessionId);
+          return;
+        }
       }
 
       switch (latestMessage.type) {
@@ -2906,6 +3324,12 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           // Store it temporarily until conversation completes (prevents premature session association)
           if (latestMessage.sessionId && !currentSessionId) {
             sessionStorage.setItem('pendingSessionId', latestMessage.sessionId);
+            if (pendingViewSessionRef.current && !pendingViewSessionRef.current.sessionId) {
+              pendingViewSessionRef.current.sessionId = latestMessage.sessionId;
+            }
+            
+            // Mark as system change to prevent clearing messages when session ID updates
+            setIsSystemSessionChange(true);
             
             // Session Protection: Replace temporary "new-session-*" identifier with real session ID
             // This maintains protection continuity - no gap between temp ID and real ID
@@ -2913,16 +3337,24 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
             if (onReplaceTemporarySession) {
               onReplaceTemporarySession(latestMessage.sessionId);
             }
+
+            // Attach the real session ID to any pending permission requests so they
+            // do not disappear during the "new-session -> real-session" transition.
+            // This does not create or auto-approve requests; it only keeps UI state aligned.
+            setPendingPermissionRequests(prev => prev.map(req => (
+              req.sessionId ? req : { ...req, sessionId: latestMessage.sessionId }
+            )));
           }
           break;
 
         case 'token-budget':
-          // Token budget now fetched via API after message completion instead of WebSocket
-          // This case is kept for compatibility but does nothing
+          // Use token budget from WebSocket for active sessions
+          if (latestMessage.data) {
+            setTokenBudget(latestMessage.data);
+          }
           break;
 
         case 'claude-response':
-          const messageData = latestMessage.data.message || latestMessage.data;
           
           // Handle Cursor streaming format (content_block_delta / content_block_stop)
           if (messageData && typeof messageData === 'object' && messageData.type) {
@@ -2991,7 +3423,8 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               latestMessage.data.subtype === 'init' && 
               latestMessage.data.session_id && 
               currentSessionId && 
-              latestMessage.data.session_id !== currentSessionId) {
+              latestMessage.data.session_id !== currentSessionId &&
+              isSystemInitForView) {
             
             console.log('🔄 Claude CLI session duplication detected:', {
               originalSession: currentSessionId,
@@ -3014,7 +3447,8 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           if (latestMessage.data.type === 'system' && 
               latestMessage.data.subtype === 'init' && 
               latestMessage.data.session_id && 
-              !currentSessionId) {
+              !currentSessionId &&
+              isSystemInitForView) {
             
             console.log('🔄 New session init detected:', {
               newSession: latestMessage.data.session_id
@@ -3035,7 +3469,8 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               latestMessage.data.subtype === 'init' && 
               latestMessage.data.session_id && 
               currentSessionId && 
-              latestMessage.data.session_id === currentSessionId) {
+              latestMessage.data.session_id === currentSessionId &&
+              isSystemInitForView) {
             console.log('🔄 System init message for current session, ignoring');
             return; // Don't process the message further
           }
@@ -3141,6 +3576,55 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           }]);
           break;
 
+        case 'claude-permission-request': {
+          // Receive a tool approval request from the backend and surface it in the UI.
+          // This does not approve anything automatically; it only queues a prompt,
+          // introduced so the user can decide before the SDK continues.
+          if (provider !== 'claude' || !latestMessage.requestId) {
+            break;
+          }
+
+          setPendingPermissionRequests(prev => {
+            if (prev.some(req => req.requestId === latestMessage.requestId)) {
+              return prev;
+            }
+            return [
+              ...prev,
+              {
+                requestId: latestMessage.requestId,
+                toolName: latestMessage.toolName || 'UnknownTool',
+                input: latestMessage.input,
+                context: latestMessage.context,
+                sessionId: latestMessage.sessionId || null,
+                receivedAt: new Date()
+              }
+            ];
+          });
+
+          // Keep the session in a "waiting" state while approval is pending.
+          // This does not resume the run; it only updates the UI status so the
+          // user knows Claude is blocked on a decision.
+          setIsLoading(true);
+          setCanAbortSession(true);
+          setClaudeStatus({
+            text: 'Waiting for permission',
+            tokens: 0,
+            can_interrupt: true
+          });
+          break;
+        }
+
+        case 'claude-permission-cancelled': {
+          // Backend cancelled the approval (timeout or SDK cancel); remove the banner.
+          // We currently do not show a user-facing warning here; this is intentional
+          // to avoid noisy alerts when the SDK cancels in the background.
+          if (!latestMessage.requestId) {
+            break;
+          }
+          setPendingPermissionRequests(prev => prev.filter(req => req.requestId !== latestMessage.requestId));
+          break;
+        }
+
         case 'claude-error':
           setChatMessages(prev => [...prev, {
             type: 'error',
@@ -3154,6 +3638,9 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           try {
             const cdata = latestMessage.data;
             if (cdata && cdata.type === 'system' && cdata.subtype === 'init' && cdata.session_id) {
+              if (!isSystemInitForView) {
+                return;
+              }
               // If we already have a session and this differs, switch (duplication/redirect)
               if (currentSessionId && cdata.session_id !== currentSessionId) {
                 console.log('🔄 Cursor session switch detected:', { originalSession: currentSessionId, newSession: cdata.session_id });
@@ -3311,23 +3798,6 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
             setIsLoading(false);
             setCanAbortSession(false);
             setClaudeStatus(null);
-
-            // Fetch updated token usage after message completes
-            if (selectedProject && selectedSession?.id) {
-              const fetchUpdatedTokenUsage = async () => {
-                try {
-                  const url = `/api/projects/${selectedProject.name}/sessions/${selectedSession.id}/token-usage`;
-                  const response = await authenticatedFetch(url);
-                  if (response.ok) {
-                    const data = await response.json();
-                    setTokenBudget(data);
-                  }
-                } catch (error) {
-                  console.error('Failed to fetch updated token usage:', error);
-                }
-              };
-              fetchUpdatedTokenUsage();
-            }
           }
 
           // Always mark the completed session as inactive and not processing
@@ -3354,8 +3824,163 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           if (selectedProject && latestMessage.exitCode === 0) {
             safeLocalStorage.removeItem(`chat_messages_${selectedProject.name}`);
           }
+          // Conversation finished; clear any stale permission prompts.
+          // This does not remove saved permissions; it only resets transient UI state.
+          setPendingPermissionRequests([]);
           break;
-          
+
+        case 'codex-response':
+          // Handle Codex SDK responses
+          const codexData = latestMessage.data;
+          if (codexData) {
+            // Handle item events
+            if (codexData.type === 'item') {
+              switch (codexData.itemType) {
+                case 'agent_message':
+                  if (codexData.message?.content?.trim()) {
+                    const content = decodeHtmlEntities(codexData.message.content);
+                    setChatMessages(prev => [...prev, {
+                      type: 'assistant',
+                      content: content,
+                      timestamp: new Date()
+                    }]);
+                  }
+                  break;
+
+                case 'reasoning':
+                  if (codexData.message?.content?.trim()) {
+                    const content = decodeHtmlEntities(codexData.message.content);
+                    setChatMessages(prev => [...prev, {
+                      type: 'assistant',
+                      content: content,
+                      timestamp: new Date(),
+                      isThinking: true
+                    }]);
+                  }
+                  break;
+
+                case 'command_execution':
+                  if (codexData.command) {
+                    setChatMessages(prev => [...prev, {
+                      type: 'assistant',
+                      content: '',
+                      timestamp: new Date(),
+                      isToolUse: true,
+                      toolName: 'Bash',
+                      toolInput: codexData.command,
+                      toolResult: codexData.output || null,
+                      exitCode: codexData.exitCode
+                    }]);
+                  }
+                  break;
+
+                case 'file_change':
+                  if (codexData.changes?.length > 0) {
+                    const changesList = codexData.changes.map(c => `${c.kind}: ${c.path}`).join('\n');
+                    setChatMessages(prev => [...prev, {
+                      type: 'assistant',
+                      content: '',
+                      timestamp: new Date(),
+                      isToolUse: true,
+                      toolName: 'FileChanges',
+                      toolInput: changesList,
+                      toolResult: `Status: ${codexData.status}`
+                    }]);
+                  }
+                  break;
+
+                case 'mcp_tool_call':
+                  setChatMessages(prev => [...prev, {
+                    type: 'assistant',
+                    content: '',
+                    timestamp: new Date(),
+                    isToolUse: true,
+                    toolName: `${codexData.server}:${codexData.tool}`,
+                    toolInput: JSON.stringify(codexData.arguments, null, 2),
+                    toolResult: codexData.result ? JSON.stringify(codexData.result, null, 2) : (codexData.error?.message || null)
+                  }]);
+                  break;
+
+                case 'error':
+                  if (codexData.message?.content) {
+                    setChatMessages(prev => [...prev, {
+                      type: 'error',
+                      content: codexData.message.content,
+                      timestamp: new Date()
+                    }]);
+                  }
+                  break;
+
+                default:
+                  console.log('[Codex] Unhandled item type:', codexData.itemType, codexData);
+              }
+            }
+
+            // Handle turn complete
+            if (codexData.type === 'turn_complete') {
+              // Turn completed, message stream done
+              setIsLoading(false);
+            }
+
+            // Handle turn failed
+            if (codexData.type === 'turn_failed') {
+              setIsLoading(false);
+              setChatMessages(prev => [...prev, {
+                type: 'error',
+                content: codexData.error?.message || 'Turn failed',
+                timestamp: new Date()
+              }]);
+            }
+          }
+          break;
+
+        case 'codex-complete':
+          // Handle Codex session completion
+          const codexCompletedSessionId = latestMessage.sessionId || currentSessionId || sessionStorage.getItem('pendingSessionId');
+
+          if (codexCompletedSessionId === currentSessionId || !currentSessionId) {
+            setIsLoading(false);
+            setCanAbortSession(false);
+            setClaudeStatus(null);
+          }
+
+          if (codexCompletedSessionId) {
+            if (onSessionInactive) {
+              onSessionInactive(codexCompletedSessionId);
+            }
+            if (onSessionNotProcessing) {
+              onSessionNotProcessing(codexCompletedSessionId);
+            }
+          }
+
+          const codexPendingSessionId = sessionStorage.getItem('pendingSessionId');
+          const codexActualSessionId = latestMessage.actualSessionId || codexPendingSessionId;
+          if (codexPendingSessionId && !currentSessionId) {
+            setCurrentSessionId(codexActualSessionId);
+            setIsSystemSessionChange(true);
+            if (onNavigateToSession) {
+              onNavigateToSession(codexActualSessionId);
+            }
+            sessionStorage.removeItem('pendingSessionId');
+            console.log('Codex session complete, ID set to:', codexPendingSessionId);
+          }
+
+          if (selectedProject) {
+            safeLocalStorage.removeItem(`chat_messages_${selectedProject.name}`);
+          }
+          break;
+
+        case 'codex-error':
+          // Handle Codex errors
+          setIsLoading(false);
+          setCanAbortSession(false);
+          setChatMessages(prev => [...prev, {
+            type: 'error',
+            content: latestMessage.error || 'An error occurred with Codex',
+            timestamp: new Date()
+          }]);
+          break;
+
         case 'session-aborted': {
           // Get session ID from message or fall back to current session
           const abortedSessionId = latestMessage.sessionId || currentSessionId;
@@ -3376,6 +4001,10 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               onSessionNotProcessing(abortedSessionId);
             }
           }
+
+          // Abort ends the run; clear permission prompts to avoid dangling UI state.
+          // This does not change allowlists; it only clears the current banner.
+          setPendingPermissionRequests([]);
 
           setChatMessages(prev => [...prev, {
             type: 'assistant',
@@ -3440,7 +4069,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
   
       }
     }
-  }, [messages]);
+  }, [latestMessage]);
 
   // Load file list when project changes
   useEffect(() => {
@@ -3480,6 +4109,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     return result;
   };
 
+
   // Handle @ symbol detection and file filtering
   useEffect(() => {
     const textBeforeCursor = input.slice(0, cursorPosition);
@@ -3509,6 +4139,43 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
       setAtSymbolPosition(-1);
     }
   }, [input, cursorPosition, fileList]);
+
+  const activeFileMentions = useMemo(() => {
+    if (!input || fileMentions.length === 0) return [];
+    return fileMentions.filter(path => input.includes(path));
+  }, [fileMentions, input]);
+
+  const sortedFileMentions = useMemo(() => {
+    if (activeFileMentions.length === 0) return [];
+    const unique = Array.from(new Set(activeFileMentions));
+    return unique.sort((a, b) => b.length - a.length);
+  }, [activeFileMentions]);
+
+  const fileMentionRegex = useMemo(() => {
+    if (sortedFileMentions.length === 0) return null;
+    const pattern = sortedFileMentions.map(escapeRegExp).join('|');
+    return new RegExp(`(${pattern})`, 'g');
+  }, [sortedFileMentions]);
+
+  const fileMentionSet = useMemo(() => new Set(sortedFileMentions), [sortedFileMentions]);
+
+  const renderInputWithMentions = useCallback((text) => {
+    if (!text) return '';
+    if (!fileMentionRegex) return text;
+    const parts = text.split(fileMentionRegex);
+    return parts.map((part, index) => (
+      fileMentionSet.has(part) ? (
+        <span
+          key={`mention-${index}`}
+          className="bg-blue-200/70 -ml-0.5 dark:bg-blue-300/40 px-0.5 rounded-md box-decoration-clone text-transparent"
+        >
+          {part}
+        </span>
+      ) : (
+        <span key={`text-${index}`}>{part}</span>
+      )
+    ));
+  }, [fileMentionRegex, fileMentionSet]);
 
   // Debounced input handling
   useEffect(() => {
@@ -3606,21 +4273,26 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     }
   }, [input]);
 
-  // Load token usage when session changes (but don't poll to avoid conflicts with WebSocket)
+  // Load token usage when session changes for Claude sessions only
+  // (Codex token usage is included in messages response, Cursor doesn't support it)
   useEffect(() => {
     if (!selectedProject || !selectedSession?.id || selectedSession.id.startsWith('new-session-')) {
-      // Reset for new/empty sessions
       setTokenBudget(null);
       return;
     }
 
-    // Fetch token usage once when session loads
+    const sessionProvider = selectedSession.__provider || 'claude';
+
+    // Skip for Codex (included in messages) and Cursor (not supported)
+    if (sessionProvider !== 'claude') {
+      return;
+    }
+
+    // Fetch token usage for Claude sessions
     const fetchInitialTokenUsage = async () => {
       try {
         const url = `/api/projects/${selectedProject.name}/sessions/${selectedSession.id}/token-usage`;
-
         const response = await authenticatedFetch(url);
-
         if (response.ok) {
           const data = await response.json();
           setTokenBudget(data);
@@ -3633,7 +4305,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     };
 
     fetchInitialTokenUsage();
-  }, [selectedSession?.id, selectedProject?.path]);
+  }, [selectedSession?.id, selectedSession?.__provider, selectedProject?.path]);
 
   const handleTranscript = useCallback((text) => {
     if (text.trim()) {
@@ -3739,6 +4411,13 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     e.preventDefault();
     if (!input.trim() || isLoading || !selectedProject) return;
 
+    // Apply thinking mode prefix if selected
+    let messageContent = input;
+    const selectedThinkingMode = thinkingModes.find(mode => mode.id === thinkingMode);
+    if (selectedThinkingMode && selectedThinkingMode.prefix) {
+      messageContent = `${selectedThinkingMode.prefix}: ${input}`;
+    }
+
     // Upload images first if any
     let uploadedImages = [];
     if (attachedImages.length > 0) {
@@ -3798,6 +4477,11 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     // Session Protection: Mark session as active to prevent automatic project updates during conversation
     // Use existing session if available; otherwise a temporary placeholder until backend provides real ID
     const sessionToActivate = effectiveSessionId || `new-session-${Date.now()}`;
+    if (!effectiveSessionId && !selectedSession?.id) {
+      // We are starting a brand-new session in this view. Track it so we only
+      // accept streaming updates for this run.
+      pendingViewSessionRef.current = { sessionId: null, startedAt: Date.now() };
+    }
     if (onSessionActive) {
       onSessionActive(sessionToActivate);
     }
@@ -3805,7 +4489,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     // Get tools settings from localStorage based on provider
     const getToolsSettings = () => {
       try {
-        const settingsKey = provider === 'cursor' ? 'cursor-tools-settings' : 'claude-settings';
+        const settingsKey = provider === 'cursor' ? 'cursor-tools-settings' : provider === 'codex' ? 'codex-settings' : 'claude-settings';
         const savedSettings = safeLocalStorage.getItem(settingsKey);
         if (savedSettings) {
           return JSON.parse(savedSettings);
@@ -3827,7 +4511,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
       // Send Cursor command (always use cursor-command; include resume/sessionId when replying)
       sendMessage({
         type: 'cursor-command',
-        command: input,
+        command: messageContent,
         sessionId: effectiveSessionId,
         options: {
           // Prefer fullPath (actual cwd for project), fallback to path
@@ -3840,11 +4524,26 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           toolsSettings: toolsSettings
         }
       });
+    } else if (provider === 'codex') {
+      // Send Codex command
+      sendMessage({
+        type: 'codex-command',
+        command: messageContent,
+        sessionId: effectiveSessionId,
+        options: {
+          cwd: selectedProject.fullPath || selectedProject.path,
+          projectPath: selectedProject.fullPath || selectedProject.path,
+          sessionId: effectiveSessionId,
+          resume: !!effectiveSessionId,
+          model: codexModel,
+          permissionMode: permissionMode === 'plan' ? 'default' : permissionMode
+        }
+      });
     } else {
       // Send Claude command (existing code)
       sendMessage({
         type: 'claude-command',
-        command: input,
+        command: messageContent,
         options: {
           projectPath: selectedProject.path,
           cwd: selectedProject.fullPath,
@@ -3852,6 +4551,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
           resume: !!currentSessionId,
           toolsSettings: toolsSettings,
           permissionMode: permissionMode,
+          model: claudeModel,
           images: uploadedImages // Pass images to backend
         }
       });
@@ -3862,6 +4562,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     setUploadingImages(new Map());
     setImageErrors(new Map());
     setIsTextareaExpanded(false);
+    setThinkingMode('none'); // Reset thinking mode after sending
 
     // Reset textarea height
     if (textareaRef.current) {
@@ -3872,7 +4573,44 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     if (selectedProject) {
       safeLocalStorage.removeItem(`draft_input_${selectedProject.name}`);
     }
-  }, [input, isLoading, selectedProject, attachedImages, currentSessionId, selectedSession, provider, permissionMode, onSessionActive, cursorModel, sendMessage, setInput, setAttachedImages, setUploadingImages, setImageErrors, setIsTextareaExpanded, textareaRef, setChatMessages, setIsLoading, setCanAbortSession, setClaudeStatus, setIsUserScrolledUp, scrollToBottom]);
+  }, [input, isLoading, selectedProject, attachedImages, currentSessionId, selectedSession, provider, permissionMode, onSessionActive, cursorModel, claudeModel, codexModel, sendMessage, setInput, setAttachedImages, setUploadingImages, setImageErrors, setIsTextareaExpanded, textareaRef, setChatMessages, setIsLoading, setCanAbortSession, setClaudeStatus, setIsUserScrolledUp, scrollToBottom, thinkingMode]);
+
+  const handleGrantToolPermission = useCallback((suggestion) => {
+    if (!suggestion || provider !== 'claude') {
+      return { success: false };
+    }
+    return grantClaudeToolPermission(suggestion.entry);
+  }, [provider]);
+
+  // Send a UI decision back to the server (single or batched request IDs).
+  // This does not validate tool inputs or permissions; the backend enforces rules.
+  // It exists so "Allow & remember" can resolve multiple queued prompts at once.
+  const handlePermissionDecision = useCallback((requestIds, decision) => {
+    const ids = Array.isArray(requestIds) ? requestIds : [requestIds];
+    const validIds = ids.filter(Boolean);
+    if (validIds.length === 0) {
+      return;
+    }
+
+    validIds.forEach((requestId) => {
+      sendMessage({
+        type: 'claude-permission-response',
+        requestId,
+        allow: Boolean(decision?.allow),
+        updatedInput: decision?.updatedInput,
+        message: decision?.message,
+        rememberEntry: decision?.rememberEntry
+      });
+    });
+
+    setPendingPermissionRequests(prev => {
+      const next = prev.filter(req => !validIds.includes(req.requestId));
+      if (next.length === 0) {
+        setClaudeStatus(null);
+      }
+      return next;
+    });
+  }, [sendMessage]);
 
   // Store handleSubmit in ref so handleCustomCommand can access it
   useEffect(() => {
@@ -3982,7 +4720,10 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     // Handle Tab key for mode switching (only when dropdowns are not showing)
     if (e.key === 'Tab' && !showFileDropdown && !showCommandMenu) {
       e.preventDefault();
-      const modes = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
+      // Codex doesn't support plan mode
+      const modes = provider === 'codex'
+        ? ['default', 'acceptEdits', 'bypassPermissions']
+        : ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
       const currentIndex = modes.indexOf(permissionMode);
       const nextIndex = (currentIndex + 1) % modes.length;
       const newMode = modes[nextIndex];
@@ -4023,8 +4764,8 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     const spaceIndex = textAfterAtQuery.indexOf(' ');
     const textAfterQuery = spaceIndex !== -1 ? textAfterAtQuery.slice(spaceIndex) : '';
     
-    const newInput = textBeforeAt + '@' + file.path + ' ' + textAfterQuery;
-    const newCursorPos = textBeforeAt.length + 1 + file.path.length + 1;
+    const newInput = textBeforeAt + file.path + ' ' + textAfterQuery;
+    const newCursorPos = textBeforeAt.length + file.path.length + 1;
     
     // Immediately ensure focus is maintained
     if (textareaRef.current && !textareaRef.current.matches(':focus')) {
@@ -4034,6 +4775,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     // Update input and cursor position
     setInput(newInput);
     setCursorPosition(newCursorPos);
+    setFileMentions(prev => (prev.includes(file.path) ? prev : [...prev, file.path]));
     
     // Hide dropdown
     setShowFileDropdown(false);
@@ -4127,12 +4869,18 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     }
   };
 
+  const syncInputOverlayScroll = useCallback((target) => {
+    if (!inputHighlightRef.current || !target) return;
+    inputHighlightRef.current.scrollTop = target.scrollTop;
+    inputHighlightRef.current.scrollLeft = target.scrollLeft;
+  }, []);
+
   const handleTextareaClick = (e) => {
     setCursorPosition(e.target.selectionStart);
   };
 
 
-
+// ! Unused
   const handleNewSession = () => {
     setChatMessages([]);
     setInput('');
@@ -4151,7 +4899,10 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
   };
 
   const handleModeSwitch = () => {
-    const modes = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
+    // Codex doesn't support plan mode
+    const modes = provider === 'codex'
+      ? ['default', 'acceptEdits', 'bypassPermissions']
+      : ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
     const currentIndex = modes.indexOf(permissionMode);
     const nextIndex = (currentIndex + 1) % modes.length;
     const newMode = modes[nextIndex];
@@ -4187,22 +4938,24 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
         {/* Messages Area - Scrollable Middle Section */}
       <div 
         ref={scrollContainerRef}
+        onWheel={handleScroll}
+        onTouchMove={handleScroll}
         className="flex-1 overflow-y-auto overflow-x-hidden px-0 py-3 sm:p-4 space-y-3 sm:space-y-4 relative"
       >
         {isLoadingSessionMessages && chatMessages.length === 0 ? (
           <div className="text-center text-gray-500 dark:text-gray-400 mt-8">
             <div className="flex items-center justify-center space-x-2">
               <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-400"></div>
-              <p>Loading session messages...</p>
+              <p>{t('session.loading.sessionMessages')}</p>
             </div>
           </div>
         ) : chatMessages.length === 0 ? (
           <div className="flex items-center justify-center h-full">
             {!selectedSession && !currentSessionId && (
               <div className="text-center px-6 sm:px-4 py-8">
-                <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-3">Choose Your AI Assistant</h2>
+                <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-3">{t('providerSelection.title')}</h2>
                 <p className="text-gray-600 dark:text-gray-400 mb-8">
-                  Select a provider to start a new conversation
+                  {t('providerSelection.description')}
                 </p>
                 
                 <div className="flex flex-col sm:flex-row gap-4 justify-center items-center mb-8">
@@ -4223,8 +4976,8 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                     <div className="flex flex-col items-center justify-center h-full gap-3">
                       <ClaudeLogo className="w-10 h-10" />
                       <div>
-                        <p className="font-semibold text-gray-900 dark:text-white">Claude</p>
-                        <p className="text-xs text-gray-500 dark:text-gray-400">by Anthropic</p>
+                        <p className="font-semibold text-gray-900 dark:text-white">Claude Code</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400">{t('providerSelection.providerInfo.anthropic')}</p>
                       </div>
                     </div>
                     {provider === 'claude' && (
@@ -4256,7 +5009,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                       <CursorLogo className="w-10 h-10" />
                       <div>
                         <p className="font-semibold text-gray-900 dark:text-white">Cursor</p>
-                        <p className="text-xs text-gray-500 dark:text-gray-400">AI Code Editor</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400">{t('providerSelection.providerInfo.cursorEditor')}</p>
                       </div>
                     </div>
                     {provider === 'cursor' && (
@@ -4269,42 +5022,106 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                       </div>
                     )}
                   </button>
-                </div>
-                
-                {/* Model Selection for Cursor - Always reserve space to prevent jumping */}
-                <div className={`mb-6 transition-opacity duration-200 ${provider === 'cursor' ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                    {provider === 'cursor' ? 'Select Model' : '\u00A0'}
-                  </label>
-                  <select
-                    value={cursorModel}
-                    onChange={(e) => {
-                      const newModel = e.target.value;
-                      setCursorModel(newModel);
-                      localStorage.setItem('cursor-model', newModel);
+
+                  {/* Codex Button */}
+                  <button
+                    onClick={() => {
+                      setProvider('codex');
+                      localStorage.setItem('selected-provider', 'codex');
+                      // Focus input after selection
+                      setTimeout(() => textareaRef.current?.focus(), 100);
                     }}
-                    className="pl-4 pr-10 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 min-w-[140px]"
-                    disabled={provider !== 'cursor'}
+                    className={`group relative w-64 h-32 bg-white dark:bg-gray-800 rounded-xl border-2 transition-all duration-200 hover:scale-105 hover:shadow-xl ${
+                      provider === 'codex'
+                        ? 'border-gray-800 dark:border-gray-300 shadow-lg ring-2 ring-gray-800/20 dark:ring-gray-300/20'
+                        : 'border-gray-200 dark:border-gray-700 hover:border-gray-500 dark:hover:border-gray-400'
+                    }`}
                   >
-                    <option value="gpt-5">GPT-5</option>
-                    <option value="sonnet-4">Sonnet-4</option>
-                    <option value="opus-4.1">Opus 4.1</option>
-                  </select>
+                    <div className="flex flex-col items-center justify-center h-full gap-3">
+                      <CodexLogo className="w-10 h-10" />
+                      <div>
+                        <p className="font-semibold text-gray-900 dark:text-white">Codex</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400">{t('providerSelection.providerInfo.openai')}</p>
+                      </div>
+                    </div>
+                    {provider === 'codex' && (
+                      <div className="absolute top-2 right-2">
+                        <div className="w-5 h-5 bg-gray-800 dark:bg-gray-300 rounded-full flex items-center justify-center">
+                          <svg className="w-3 h-3 text-white dark:text-gray-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                          </svg>
+                        </div>
+                      </div>
+                    )}
+                  </button>
+                </div>
+
+                {/* Model Selection - Always reserve space to prevent jumping */}
+                <div className={`mb-6 transition-opacity duration-200 ${provider ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                    {t('providerSelection.selectModel')}
+                  </label>
+                  {provider === 'claude' ? (
+                    <select
+                      value={claudeModel}
+                      onChange={(e) => {
+                        const newModel = e.target.value;
+                        setClaudeModel(newModel);
+                        localStorage.setItem('claude-model', newModel);
+                      }}
+                      className="pl-4 pr-10 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 min-w-[140px]"
+                    >
+                      {CLAUDE_MODELS.OPTIONS.map(({ value, label }) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
+                  ) : provider === 'codex' ? (
+                    <select
+                      value={codexModel}
+                      onChange={(e) => {
+                        const newModel = e.target.value;
+                        setCodexModel(newModel);
+                        localStorage.setItem('codex-model', newModel);
+                      }}
+                      className="pl-4 pr-10 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-gray-500 focus:border-gray-500 min-w-[140px]"
+                    >
+                      {CODEX_MODELS.OPTIONS.map(({ value, label }) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <select
+                      value={cursorModel}
+                      onChange={(e) => {
+                        const newModel = e.target.value;
+                        setCursorModel(newModel);
+                        localStorage.setItem('cursor-model', newModel);
+                      }}
+                      className="pl-4 pr-10 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 min-w-[140px]"
+                      disabled={provider !== 'cursor'}
+                    >
+                      {CURSOR_MODELS.OPTIONS.map(({ value, label }) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
+                  )}
                 </div>
                 
                 <p className="text-sm text-gray-500 dark:text-gray-400">
-                  {provider === 'claude' 
-                    ? 'Ready to use Claude AI. Start typing your message below.'
+                  {provider === 'claude'
+                    ? t('providerSelection.readyPrompt.claude', { model: claudeModel })
                     : provider === 'cursor'
-                    ? `Ready to use Cursor with ${cursorModel}. Start typing your message below.`
-                    : 'Select a provider above to begin'
+                    ? t('providerSelection.readyPrompt.cursor', { model: cursorModel })
+                    : provider === 'codex'
+                    ? t('providerSelection.readyPrompt.codex', { model: codexModel })
+                    : t('providerSelection.readyPrompt.default')
                   }
                 </p>
                 
-                {/* Show NextTaskBanner when provider is selected and ready */}
-                {provider && tasksEnabled && (
+                {/* Show NextTaskBanner when provider is selected and ready, only if TaskMaster is installed */}
+                {provider && tasksEnabled && isTaskMasterInstalled && (
                   <div className="mt-4 px-4 sm:px-0">
-                    <NextTaskBanner 
+                    <NextTaskBanner
                       onStartTask={() => setInput('Start the next task')}
                       onShowAllTasks={onShowAllTasks}
                     />
@@ -4314,15 +5131,15 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
             )}
             {selectedSession && (
               <div className="text-center text-gray-500 dark:text-gray-400 px-6 sm:px-4">
-                <p className="font-bold text-lg sm:text-xl mb-3">Continue your conversation</p>
+                <p className="font-bold text-lg sm:text-xl mb-3">{t('session.continue.title')}</p>
                 <p className="text-sm sm:text-base leading-relaxed">
-                  Ask questions about your code, request changes, or get help with development tasks
+                  {t('session.continue.description')}
                 </p>
                 
-                {/* Show NextTaskBanner for existing sessions too */}
-                {tasksEnabled && (
+                {/* Show NextTaskBanner for existing sessions too, only if TaskMaster is installed */}
+                {tasksEnabled && isTaskMasterInstalled && (
                   <div className="mt-4 px-4 sm:px-0">
-                    <NextTaskBanner 
+                    <NextTaskBanner
                       onStartTask={() => setInput('Start the next task')}
                       onShowAllTasks={onShowAllTasks}
                     />
@@ -4338,7 +5155,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               <div className="text-center text-gray-500 dark:text-gray-400 py-3">
                 <div className="flex items-center justify-center space-x-2">
                   <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-400"></div>
-                  <p className="text-sm">Loading older messages...</p>
+                  <p className="text-sm">{t('session.loading.olderMessages')}</p>
                 </div>
               </div>
             )}
@@ -4348,8 +5165,8 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               <div className="text-center text-gray-500 dark:text-gray-400 text-sm py-2 border-b border-gray-200 dark:border-gray-700">
                 {totalMessages > 0 && (
                   <span>
-                    Showing {sessionMessages.length} of {totalMessages} messages • 
-                    <span className="text-xs">Scroll up to load more</span>
+                    {t('session.messages.showingOf', { shown: sessionMessages.length, total: totalMessages })} •
+                    <span className="text-xs">{t('session.messages.scrollToLoad')}</span>
                   </span>
                 )}
               </div>
@@ -4358,12 +5175,12 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
             {/* Legacy message count indicator (for non-paginated view) */}
             {!hasMoreMessages && chatMessages.length > visibleMessageCount && (
               <div className="text-center text-gray-500 dark:text-gray-400 text-sm py-2 border-b border-gray-200 dark:border-gray-700">
-                Showing last {visibleMessageCount} messages ({chatMessages.length} total) • 
-                <button 
+                {t('session.messages.showingLast', { count: visibleMessageCount, total: chatMessages.length })} •
+                <button
                   className="ml-1 text-blue-600 hover:text-blue-700 underline"
                   onClick={loadEarlierMessages}
                 >
-                  Load earlier messages
+                  {t('session.messages.loadEarlier')}
                 </button>
               </div>
             )}
@@ -4380,10 +5197,12 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                   createDiff={createDiff}
                   onFileOpen={onFileOpen}
                   onShowSettings={onShowSettings}
+                  onGrantToolPermission={handleGrantToolPermission}
                   autoExpandTools={autoExpandTools}
                   showRawParameters={showRawParameters}
                   showThinking={showThinking}
                   selectedProject={selectedProject}
+                  provider={provider}
                 />
               );
             })}
@@ -4397,11 +5216,13 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                 <div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0 p-1 bg-transparent">
                   {(localStorage.getItem('selected-provider') || 'claude') === 'cursor' ? (
                     <CursorLogo className="w-full h-full" />
+                  ) : (localStorage.getItem('selected-provider') || 'claude') === 'codex' ? (
+                    <CodexLogo className="w-full h-full" />
                   ) : (
                     <ClaudeLogo className="w-full h-full" />
                   )}
                 </div>
-                <div className="text-sm font-medium text-gray-900 dark:text-white">{(localStorage.getItem('selected-provider') || 'claude') === 'cursor' ? 'Cursor' : 'Claude'}</div>
+                <div className="text-sm font-medium text-gray-900 dark:text-white">{(localStorage.getItem('selected-provider') || 'claude') === 'cursor' ? 'Cursor' : (localStorage.getItem('selected-provider') || 'claude') === 'codex' ? 'Codex' : 'Claude'}</div>
                 {/* Abort button removed - functionality not yet implemented at backend */}
               </div>
               <div className="w-full text-sm text-gray-500 dark:text-gray-400 pl-3 sm:pl-0">
@@ -4436,6 +5257,101 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               </div>
         {/* Permission Mode Selector with scroll to bottom button - Above input, clickable for mobile */}
         <div ref={inputContainerRef} className="max-w-4xl mx-auto mb-3">
+          {pendingPermissionRequests.length > 0 && (
+            // Permission banner for tool approvals. This renders the input, allows
+            // "allow once" or "allow & remember", and supports batching similar requests.
+            // It does not persist permissions by itself; persistence is handled by
+            // the existing localStorage-based settings helpers, introduced to surface
+            // approvals before tool execution resumes.
+            <div className="mb-3 space-y-2">
+              {pendingPermissionRequests.map((request) => {
+                const rawInput = formatToolInputForDisplay(request.input);
+                const permissionEntry = buildClaudeToolPermissionEntry(request.toolName, rawInput);
+                const settings = getClaudeSettings();
+                const alreadyAllowed = permissionEntry
+                  ? settings.allowedTools.includes(permissionEntry)
+                  : false;
+                const rememberLabel = alreadyAllowed ? 'Allow (saved)' : 'Allow & remember';
+                // Group pending prompts that resolve to the same allow rule so
+                // a single "Allow & remember" can clear them in one click.
+                // This does not attempt fuzzy matching; it only batches identical rules.
+                const matchingRequestIds = permissionEntry
+                  ? pendingPermissionRequests
+                    .filter(item => buildClaudeToolPermissionEntry(item.toolName, formatToolInputForDisplay(item.input)) === permissionEntry)
+                    .map(item => item.requestId)
+                  : [request.requestId];
+
+                return (
+                  <div
+                    key={request.requestId}
+                    className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 p-3 shadow-sm"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-amber-900 dark:text-amber-100">
+                          Permission required
+                        </div>
+                        <div className="text-xs text-amber-800 dark:text-amber-200">
+                          Tool: <span className="font-mono">{request.toolName}</span>
+                        </div>
+                      </div>
+                      {permissionEntry && (
+                        <div className="text-xs text-amber-700 dark:text-amber-300">
+                          Allow rule: <span className="font-mono">{permissionEntry}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {rawInput && (
+                      <details className="mt-2">
+                        <summary className="cursor-pointer text-xs text-amber-800 dark:text-amber-200 hover:text-amber-900 dark:hover:text-amber-100">
+                          View tool input
+                        </summary>
+                        <pre className="mt-2 max-h-40 overflow-auto rounded-md bg-white/80 dark:bg-gray-900/60 border border-amber-200/60 dark:border-amber-800/60 p-2 text-xs text-amber-900 dark:text-amber-100 whitespace-pre-wrap">
+                          {rawInput}
+                        </pre>
+                      </details>
+                    )}
+
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handlePermissionDecision(request.requestId, { allow: true })}
+                        className="inline-flex items-center gap-2 rounded-md bg-amber-600 text-white text-xs font-medium px-3 py-1.5 hover:bg-amber-700 transition-colors"
+                      >
+                        Allow once
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (permissionEntry && !alreadyAllowed) {
+                            handleGrantToolPermission({ entry: permissionEntry, toolName: request.toolName });
+                          }
+                          handlePermissionDecision(matchingRequestIds, { allow: true, rememberEntry: permissionEntry });
+                        }}
+                        className={`inline-flex items-center gap-2 rounded-md text-xs font-medium px-3 py-1.5 border transition-colors ${
+                          permissionEntry
+                            ? 'border-amber-300 text-amber-800 hover:bg-amber-100 dark:border-amber-700 dark:text-amber-100 dark:hover:bg-amber-900/30'
+                            : 'border-gray-300 text-gray-400 cursor-not-allowed'
+                        }`}
+                        disabled={!permissionEntry}
+                      >
+                        {rememberLabel}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handlePermissionDecision(request.requestId, { allow: false, message: 'User denied tool use' })}
+                        className="inline-flex items-center gap-2 rounded-md text-xs font-medium px-3 py-1.5 border border-red-300 text-red-700 hover:bg-red-50 dark:border-red-800 dark:text-red-200 dark:hover:bg-red-900/30 transition-colors"
+                      >
+                        Deny
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           <div className="flex items-center justify-center gap-3">
             <button
               type="button"
@@ -4449,7 +5365,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                   ? 'bg-orange-50 dark:bg-orange-900/20 text-orange-700 dark:text-orange-300 border-orange-300 dark:border-orange-600 hover:bg-orange-100 dark:hover:bg-orange-900/30'
                   : 'bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-600 hover:bg-blue-100 dark:hover:bg-blue-900/30'
               }`}
-              title="Click to change permission mode (or press Tab in input)"
+              title={t('input.clickToChangeMode')}
             >
               <div className="flex items-center gap-2">
                 <div className={`w-2 h-2 rounded-full ${
@@ -4462,13 +5378,24 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                     : 'bg-blue-500'
                 }`} />
                 <span>
-                  {permissionMode === 'default' && 'Default Mode'}
-                  {permissionMode === 'acceptEdits' && 'Accept Edits'}
-                  {permissionMode === 'bypassPermissions' && 'Bypass Permissions'}
-                  {permissionMode === 'plan' && 'Plan Mode'}
+                  {permissionMode === 'default' && t('codex.modes.default')}
+                  {permissionMode === 'acceptEdits' && t('codex.modes.acceptEdits')}
+                  {permissionMode === 'bypassPermissions' && t('codex.modes.bypassPermissions')}
+                  {permissionMode === 'plan' && t('codex.modes.plan')}
                 </span>
               </div>
             </button>
+            
+              {/* Thinking Mode Selector */}
+              {
+                provider === 'claude' && (
+
+                  <ThinkingModeSelector
+                    selectedMode={thinkingMode}
+                    onModeChange={setThinkingMode}
+                    className=""
+                  />
+                )}
             {/* Token usage pie chart - positioned next to mode indicator */}
             <TokenUsagePie
               used={tokenBudget?.used || 0}
@@ -4494,7 +5421,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                 }
               }}
               className="relative w-8 h-8 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800"
-              title="Show all commands"
+              title={t('input.showAllCommands')}
             >
               <svg
                 className="w-5 h-5"
@@ -4659,6 +5586,16 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
 
           <div {...getRootProps()} className={`relative bg-white dark:bg-gray-800 rounded-2xl shadow-lg border border-gray-200 dark:border-gray-600 focus-within:ring-2 focus-within:ring-blue-500 dark:focus-within:ring-blue-500 focus-within:border-blue-500 transition-all duration-200 overflow-hidden ${isTextareaExpanded ? 'chat-input-expanded' : ''}`}>
             <input {...getInputProps()} />
+            <div
+              ref={inputHighlightRef}
+              aria-hidden="true"
+              className="absolute inset-0 pointer-events-none overflow-hidden rounded-2xl"
+            >
+              <div className="chat-input-placeholder block w-full pl-12 pr-20 sm:pr-40 py-1.5 sm:py-4 text-transparent text-base leading-6 whitespace-pre-wrap break-words">
+                {renderInputWithMentions(input)}
+              </div>
+            </div>
+            <div className="relative z-10">
             <textarea
               ref={textareaRef}
               value={input}
@@ -4666,6 +5603,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               onClick={handleTextareaClick}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
+              onScroll={(e) => syncInputOverlayScroll(e.target)}
               onFocus={() => setIsInputFocused(true)}
               onBlur={() => setIsInputFocused(false)}
               onInput={(e) => {
@@ -4673,15 +5611,16 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
                 e.target.style.height = 'auto';
                 e.target.style.height = e.target.scrollHeight + 'px';
                 setCursorPosition(e.target.selectionStart);
+                syncInputOverlayScroll(e.target);
 
                 // Check if textarea is expanded (more than 2 lines worth of height)
                 const lineHeight = parseInt(window.getComputedStyle(e.target).lineHeight);
                 const isExpanded = e.target.scrollHeight > lineHeight * 2;
                 setIsTextareaExpanded(isExpanded);
               }}
-              placeholder={`Type / for commands, @ for files, or ask ${provider === 'cursor' ? 'Cursor' : 'Claude'} anything...`}
+              placeholder={t('input.placeholder', { provider: provider === 'cursor' ? t('messageTypes.cursor') : provider === 'codex' ? t('messageTypes.codex') : t('messageTypes.claude') })}
               disabled={isLoading}
-              className="chat-input-placeholder block w-full pl-12 pr-20 sm:pr-40 py-1.5 sm:py-4 bg-transparent rounded-2xl focus:outline-none text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 disabled:opacity-50 resize-none min-h-[50px] sm:min-h-[80px] max-h-[40vh] sm:max-h-[300px] overflow-y-auto text-sm sm:text-base leading-[21px] sm:leading-6 transition-all duration-200"
+              className="chat-input-placeholder block w-full pl-12 pr-20 sm:pr-40 py-1.5 sm:py-4 bg-transparent rounded-2xl focus:outline-none text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 disabled:opacity-50 resize-none min-h-[50px] sm:min-h-[80px] max-h-[40vh] sm:max-h-[300px] overflow-y-auto text-base leading-6 transition-all duration-200"
               style={{ height: '50px' }}
             />
             {/* Image upload button */}
@@ -4689,7 +5628,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               type="button"
               onClick={open}
               className="absolute left-2 top-1/2 transform -translate-y-1/2 p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
-              title="Attach images"
+              title={t('input.attachImages')}
             >
               <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
@@ -4738,8 +5677,9 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               input.trim() ? 'opacity-0' : 'opacity-100'
             }`}>
               {sendByCtrlEnter
-                ? "Ctrl+Enter to send • Shift+Enter for new line • Tab to change modes • / for slash commands"
-                : "Enter to send • Shift+Enter for new line • Tab to change modes • / for slash commands"}
+                ? t('input.hintText.ctrlEnter')
+                : t('input.hintText.enter')}
+            </div>
             </div>
           </div>
         </form>

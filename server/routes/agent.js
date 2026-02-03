@@ -8,7 +8,10 @@ import { userDb, apiKeysDb, githubTokensDb } from '../database/db.js';
 import { addProjectManually } from '../projects.js';
 import { queryClaudeSDK } from '../claude-sdk.js';
 import { spawnCursor } from '../cursor-cli.js';
+import { queryCodex } from '../openai-codex.js';
 import { Octokit } from '@octokit/rest';
+import { CLAUDE_MODELS, CURSOR_MODELS, CODEX_MODELS } from '../../shared/modelConstants.js';
+import { IS_PLATFORM } from '../constants/config.js';
 
 const router = express.Router();
 
@@ -16,7 +19,7 @@ const router = express.Router();
  * Middleware to authenticate agent API requests.
  *
  * Supports two authentication modes:
- * 1. Platform mode (VITE_IS_PLATFORM=true): For managed/hosted deployments where
+ * 1. Platform mode (IS_PLATFORM=true): For managed/hosted deployments where
  *    authentication is handled by an external proxy. Requests are trusted and
  *    the default user context is used.
  *
@@ -26,7 +29,7 @@ const router = express.Router();
 const validateExternalApiKey = (req, res, next) => {
   // Platform mode: Authentication is handled externally (e.g., by a proxy layer).
   // Trust the request and use the default user context.
-  if (process.env.VITE_IS_PLATFORM === 'true') {
+  if (IS_PLATFORM) {
     try {
       const user = userDb.getFirstUser();
       if (!user) {
@@ -449,6 +452,7 @@ class SSEStreamWriter {
   constructor(res) {
     this.res = res;
     this.sessionId = null;
+    this.isSSEStreamWriter = true;  // Marker for transport detection
   }
 
   send(data) {
@@ -456,7 +460,7 @@ class SSEStreamWriter {
       return;
     }
 
-    // Format as SSE
+    // Format as SSE - providers send raw objects, we stringify
     this.res.write(`data: ${JSON.stringify(data)}\n\n`);
   }
 
@@ -633,9 +637,14 @@ class ResponseCollector {
  *                          - true: Returns text/event-stream with incremental updates
  *                          - false: Returns complete JSON response after completion
  *
- * @param {string} model - (Optional) Model identifier for Cursor provider.
- *                        Only applicable when provider='cursor'.
- *                        Examples: 'gpt-4', 'claude-3-opus', etc.
+ * @param {string} model - (Optional) Model identifier for providers.
+ *
+ *                        Claude models: 'sonnet' (default), 'opus', 'haiku', 'opusplan', 'sonnet[1m]'
+ *                        Cursor models: 'gpt-5' (default), 'gpt-5.2', 'gpt-5.2-high', 'sonnet-4.5', 'opus-4.5',
+ *                                       'gemini-3-pro', 'composer-1', 'auto', 'gpt-5.1', 'gpt-5.1-high',
+ *                                       'gpt-5.1-codex', 'gpt-5.1-codex-high', 'gpt-5.1-codex-max',
+ *                                       'gpt-5.1-codex-max-high', 'opus-4.1', 'grok', and thinking variants
+ *                        Codex models: 'gpt-5.2' (default), 'gpt-5.1-codex-max', 'o3', 'o4-mini'
  *
  * @param {boolean} cleanup - (Optional) Auto-cleanup project directory after completion.
  *                           Default: true
@@ -846,8 +855,8 @@ router.post('/', validateExternalApiKey, async (req, res) => {
     return res.status(400).json({ error: 'message is required' });
   }
 
-  if (!['claude', 'cursor'].includes(provider)) {
-    return res.status(400).json({ error: 'provider must be "claude" or "cursor"' });
+  if (!['claude', 'cursor', 'codex'].includes(provider)) {
+    return res.status(400).json({ error: 'provider must be "claude", "cursor", or "codex"' });
   }
 
   // Validate GitHub branch/PR creation requirements
@@ -938,6 +947,7 @@ router.post('/', validateExternalApiKey, async (req, res) => {
         projectPath: finalProjectPath,
         cwd: finalProjectPath,
         sessionId: null, // New session
+        model: model,
         permissionMode: 'bypassPermissions' // Bypass all permissions for API calls
       }, writer);
 
@@ -950,6 +960,16 @@ router.post('/', validateExternalApiKey, async (req, res) => {
         sessionId: null, // New session
         model: model || undefined,
         skipPermissions: true // Bypass permissions for Cursor
+      }, writer);
+    } else if (provider === 'codex') {
+      console.log('🤖 Starting Codex SDK session');
+
+      await queryCodex(message.trim(), {
+        projectPath: finalProjectPath,
+        cwd: finalProjectPath,
+        sessionId: null,
+        model: model || CODEX_MODELS.DEFAULT,
+        permissionMode: 'bypassPermissions'
       }, writer);
     }
 

@@ -1,16 +1,18 @@
 import { X } from 'lucide-react';
 import StandaloneShell from './StandaloneShell';
+import { IS_PLATFORM } from '../constants/config';
 
 /**
- * Reusable login modal component for Claude and Cursor CLI authentication
+ * Reusable login modal component for Claude, Cursor, and Codex CLI authentication
  *
  * @param {Object} props
  * @param {boolean} props.isOpen - Whether the modal is visible
  * @param {Function} props.onClose - Callback when modal is closed
- * @param {'claude'|'cursor'} props.provider - Which CLI provider to authenticate with
+ * @param {'claude'|'cursor'|'codex'} props.provider - Which CLI provider to authenticate with
  * @param {Object} props.project - Project object containing name and path information
  * @param {Function} props.onComplete - Callback when login process completes (receives exitCode)
  * @param {string} props.customCommand - Optional custom command to override defaults
+ * @param {boolean} props.isAuthenticated - Whether user is already authenticated (for re-auth flow)
  */
 function LoginModal({
   isOpen,
@@ -18,7 +20,8 @@ function LoginModal({
   provider = 'claude',
   project,
   onComplete,
-  customCommand
+  customCommand,
+  isAuthenticated = false
 }) {
   if (!isOpen) return null;
 
@@ -27,11 +30,13 @@ function LoginModal({
 
     switch (provider) {
       case 'claude':
-        return 'claude setup-token --dangerously-skip-permissions';
+        return isAuthenticated ? 'claude setup-token --dangerously-skip-permissions' : 'claude /exit --dangerously-skip-permissions';
       case 'cursor':
         return 'cursor-agent login';
+      case 'codex':
+        return IS_PLATFORM ? 'codex login --device-auth' : 'codex login';
       default:
-        return 'claude setup-token --dangerously-skip-permissions';
+        return isAuthenticated ? 'claude setup-token --dangerously-skip-permissions' : 'claude /exit --dangerously-skip-permissions';
     }
   };
 
@@ -41,6 +46,8 @@ function LoginModal({
         return 'Claude CLI Login';
       case 'cursor':
         return 'Cursor CLI Login';
+      case 'codex':
+        return 'Codex CLI Login';
       default:
         return 'CLI Login';
     }
