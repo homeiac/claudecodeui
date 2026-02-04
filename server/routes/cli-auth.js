@@ -74,11 +74,50 @@ router.get('/codex/status', async (req, res) => {
   }
 });
 
+async function refreshClaudeToken(creds, credPath) {
+  const oauth = creds.claudeAiOauth;
+  if (!oauth || !oauth.refreshToken) {
+    return null;
+  }
+
+  try {
+    const response = await fetch('https://platform.claude.com/v1/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: oauth.refreshToken,
+        client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+      }),
+    });
+
+    if (!response.ok) {
+      console.error('Token refresh failed:', response.status);
+      return null;
+    }
+
+    const tokens = await response.json();
+    creds.claudeAiOauth = {
+      ...oauth,
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token || oauth.refreshToken,
+      expiresAt: Date.now() + (tokens.expires_in * 1000),
+    };
+
+    await fs.writeFile(credPath, JSON.stringify(creds, null, 2));
+    console.log('Claude OAuth token refreshed successfully');
+    return creds;
+  } catch (error) {
+    console.error('Token refresh error:', error.message);
+    return null;
+  }
+}
+
 async function checkClaudeCredentials() {
   try {
     const credPath = path.join(os.homedir(), '.claude', '.credentials.json');
     const content = await fs.readFile(credPath, 'utf8');
-    const creds = JSON.parse(content);
+    let creds = JSON.parse(content);
 
     const oauth = creds.claudeAiOauth;
     if (oauth && oauth.accessToken) {
@@ -89,6 +128,17 @@ async function checkClaudeCredentials() {
           authenticated: true,
           email: creds.email || creds.user || null
         };
+      }
+
+      // Token expired — try refreshing
+      if (oauth.refreshToken) {
+        const refreshed = await refreshClaudeToken(creds, credPath);
+        if (refreshed) {
+          return {
+            authenticated: true,
+            email: refreshed.email || refreshed.user || null
+          };
+        }
       }
     }
 
