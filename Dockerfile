@@ -28,8 +28,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
 # Install Flux CLI
 RUN curl -s https://fluxcd.io/install.sh | bash
 
-# Install Claude CLI globally
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude CLI via native installer (npm method is deprecated)
+# Installs to /root/.claude/bin as root, then copy to system PATH
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && cp /root/.claude/bin/claude /usr/local/bin/claude
 
 # Create app directory
 WORKDIR /app
