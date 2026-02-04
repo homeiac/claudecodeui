@@ -65,6 +65,7 @@ EXPOSE 3001
 
 ENV PORT=3001
 ENV NODE_ENV=production
+ENV PATH="/home/claude/.local/bin:$PATH"
 
 # Start server
 CMD ["node", "server/cli.js", "start"]
