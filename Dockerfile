@@ -29,9 +29,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
 RUN curl -s https://fluxcd.io/install.sh | bash
 
 # Install Claude CLI via native installer (npm method is deprecated)
-# Installs to /root/.claude/bin as root, then copy to system PATH
+# Installs to ~/.local/bin as root, then copy to system PATH
 RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && cp /root/.claude/bin/claude /usr/local/bin/claude
+    && cp /root/.local/bin/claude /usr/local/bin/claude
 
 # Create app directory
 WORKDIR /app
